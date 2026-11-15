@@ -1,0 +1,7 @@
+{
+  "version": "1.1.1",
+  "url": "https://raw.githubusercontent.com/kaneki654/FBVenom/main/dist/FBVenom.exe",
+  "sha256": "af34effdae379cf3c1e3859da93004c7a61db6ae325444d0236b5a175d8bb50d",
+  "notes": "Venom interface, expanded Facebook live/link support, printable diagnostics, and Windows updater fixes.",
+  "published_at": "2026-11-15T17:14:37.110685+00:00"
+}

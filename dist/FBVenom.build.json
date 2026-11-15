@@ -1,0 +1,30 @@
+{
+  "version": "1.1.1",
+  "source_commit": "1c8864639b473798d7a42d4c12127c6ab4d0aee4",
+  "built_at": "2026-11-15T17:11:07.538526+00:00",
+  "filename": "FBVenom.exe",
+  "size_bytes": 67242376,
+  "sha256": "af34effdae379cf3c1e3859da93004c7a61db6ae325444d0236b5a175d8bb50d",
+  "format": "PE32+",
+  "architecture": "x86_64",
+  "subsystem": "Windows GUI",
+  "windows_smoke_test": "passed",
+  "checks": {
+    "frozen": true,
+    "windows": true,
+    "adb_bundled": true,
+    "adb_version_ok": true,
+    "icon_loaded": true,
+    "config_beside_exe": true,
+    "app_beside_exe": true,
+    "auth_imported": true
+  },
+  "gui_features": {
+    "live_link_normalization": true,
+    "structured_errors": true,
+    "venom_theme": true,
+    "diagnostics_panel": true
+  },
+  "adb_version": "Android Debug Bridge version 1.0.41",
+  "workflow_run": "https://github.com/kaneki654/FBVenom/actions/runs/43739508728"
+}
