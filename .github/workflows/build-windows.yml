@@ -1,0 +1,52 @@
+name: Build Windows executable
+run-name: Windows executable for ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Run offline regression tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -v
+      - name: Download Windows Android platform-tools
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "platform-tools-windows.zip"
+          $tools = Join-Path $env:RUNNER_TEMP "android-platform-tools"
+          Invoke-WebRequest "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile $archive
+          Expand-Archive $archive -DestinationPath $tools -Force
+          "FBVENOM_PLATFORM_TOOLS=$(Join-Path $tools 'platform-tools')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build Windows executable
+        run: python -m PyInstaller --clean --noconfirm FBVenom.spec
+      - name: Verify executable and frozen startup
+        run: python tools_validate_windows_build.py dist/FBVenom.exe --source-commit "${{ github.sha }}"
+      - name: Upload verified Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: FBVenom-windows-x64
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          path: |
+            dist/FBVenom.exe
+            dist/FBVenom.sha256
+            dist/FBVenom.build.json

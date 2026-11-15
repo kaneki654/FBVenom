@@ -26,7 +26,7 @@ to share the displayed report or **Clear** to reset the panel.
 
 ## Running
 
-Local AI settings, saved workspaces, logs and build output are ignored by Git. Configure AI from **AI SETTINGS**, or copy `venom_ai.example.json` to `venom_ai.json` and add your key locally. Distribute executables through GitHub Releases.
+Local AI settings, saved workspaces, logs and build intermediates are ignored by Git. Configure AI from **AI SETTINGS**, or copy `venom_ai.example.json` to `venom_ai.json` and add your key locally. The verified Windows executable and its checksum/build metadata are versioned in `dist/`.
 
 ```bash
 python fbvenom.py
@@ -67,14 +67,30 @@ manual device selection and its own draft when switching tabs.
 
 ## Windows EXE build
 
-The reproducible one-file build is defined in `FBVenom.spec`. It embeds the
+Build on **64-bit Windows with Python 3.12**. The one-file build is defined in
+`FBVenom.spec`. It embeds the
 generated application icon, Android `adb.exe` plus its two Windows DLLs,
 PyQt6, uiautomator2/adbutils, Pillow and the post-reading dependencies:
 
+Download Google's Windows Android platform-tools and extract the
+`platform-tools` directory beside `FBVenom.spec`, or set
+`FBVENOM_PLATFORM_TOOLS` to its directory. Linux ADB cannot be bundled into a
+Windows executable.
+
 ```powershell
-python -m pip install --upgrade pyinstaller
+python -m pip install -r requirements-build.txt
+python -m unittest discover -v
 python -m PyInstaller --clean --noconfirm FBVenom.spec
+python tools_validate_windows_build.py dist/FBVenom.exe --source-commit (git rev-parse HEAD)
 ```
+
+The **Build Windows executable** GitHub Actions workflow performs the same
+build on a native Windows runner and saves a verified executable artifact.
+Validation checks the Windows x64 GUI executable headers, frozen startup,
+bundled ADB execution, icons, local settings paths and updated GUI features.
+`dist/FBVenom.sha256` and `dist/FBVenom.build.json` record its checksum,
+source commit, app version and Windows validation results. No license entry,
+provider calls or phone posting is performed by the packaging smoke check.
 
 The result is `dist/FBVenom.exe`. `venom_ai.json` deliberately is **not**
 embedded into the executable because it contains a private API key and must

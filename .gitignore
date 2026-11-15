@@ -5,9 +5,14 @@ __pycache__/
 .venv/
 venv/
 
-# Local builds belong in GitHub Release assets
+# Build intermediates stay local; the verified Windows bundle is versioned.
 /build/
-/dist/
+/platform-tools/
+/dist/*
+!/dist/FBVenom.exe
+!/dist/FBVenom.sha256
+!/dist/FBVenom.build.json
+!/dist/manifest.json
 
 # Private settings and runtime data
 /venom_ai.json

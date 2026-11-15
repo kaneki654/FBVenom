@@ -1,0 +1,7 @@
+# Windows x64, Python 3.12. Direct versions verified on PyPI.
+# Runtime dependencies are included so a clean Windows runner can build.
+PyInstaller==6.22.3
+PyQt6==6.11.0
+Pillow==12.1.1
+uiautomator2==3.7.0
+adbutils==2.12.0
