@@ -14,7 +14,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 import updater
 
@@ -44,8 +44,8 @@ class _Sandbox(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.root = self.dir.name
-        self.app = os.path.join(self.root, "FBVenom")
-        self._write(self.app, "#!/bin/sh\nexit 0\n", executable=True)
+        self.app = os.path.join(self.root, "FBVenom.cmd" if os.name == "nt" else "FBVenom")
+        self._write(self.app, self._application_body(), executable=True)
         for name, value in (("APP_DIR", self.root), ("APP_PATH", self.app),
                             ("SETTINGS_PATH",
                              os.path.join(self.root, "venom_update.json"))):
@@ -53,8 +53,16 @@ class _Sandbox(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
+    @staticmethod
+    def _application_body(label="fixture"):
+        if os.name == "nt":
+            # `start` launches a batch file in a separate command processor;
+            # exit that child entirely so the test never leaves a console up.
+            return f"@echo off\r\nrem # {label}\r\nexit 0\r\n"
+        return f"#!/bin/sh\n# {label}\nexit 0\n"
+
     def _write(self, path, text, executable=False):
-        with open(path, "w", encoding="utf-8") as fh:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
         if executable:
             os.chmod(path, 0o755)
@@ -62,7 +70,7 @@ class _Sandbox(unittest.TestCase):
 
     def _manifest_file(self, **over):
         build = over.pop("build", None) or self._write(
-            os.path.join(self.root, "new-build"), "#!/bin/sh\nexit 0\n", True)
+            os.path.join(self.root, "new-build"), self._application_body("NEW"), True)
         with open(build, "rb") as fh:
             digest = hashlib.sha256(fh.read()).hexdigest()
         data = {"version": "9.9.9", "url": build, "sha256": digest,
@@ -94,6 +102,32 @@ class DefaultChannelTests(_Sandbox):
         updater.save_settings({"manifest_url": "https://elsewhere/m.json"})
         self.assertEqual(updater.load_settings()["manifest_url"],
                          "https://elsewhere/m.json")
+
+
+class LocationTests(unittest.TestCase):
+    def test_absolute_windows_drive_and_unc_paths_are_local(self):
+        for path in (r"C:\Program Files\FBVenom\manifest.json",
+                     "c:/Users/Test User/FBVenom.exe",
+                     r"\\server\updates\FBVenom.exe", "//server/updates/manifest.json"):
+            with self.subTest(path=path):
+                self.assertEqual(updater._check_location(path, "Update address"), "local")
+                self.assertEqual(updater._local_path(path), path)
+
+    def test_windows_paths_are_read_from_disk_without_urlopen(self):
+        for path in (r"C:\updates\manifest.json", r"\\server\updates\manifest.json"):
+            with self.subTest(path=path), \
+                    patch("builtins.open", mock_open(read_data=b"{}")) as disk, \
+                    patch.object(updater.urllib.request, "urlopen") as network:
+                self.assertEqual(updater._read(path, 1024), b"{}")
+                disk.assert_called_once_with(path, "rb")
+                network.assert_not_called()
+
+    def test_drive_path_support_preserves_https_only_network_policy(self):
+        self.assertEqual(updater._check_location("https://example.com/manifest.json", "Update"), "https")
+        for address in ("http://example.com/manifest.json", "ftp://example.com/build.exe",
+                        r"C:relative\manifest.json"):
+            with self.subTest(address=address), self.assertRaises(updater.UpdateError):
+                updater._check_location(address, "Update")
 
 
 class RedirectTests(unittest.TestCase):
@@ -174,7 +208,8 @@ class SwapTests(_Sandbox):
     """Run the real swap script and check which build ends up where."""
 
     def _run_swap(self, script):
-        subprocess.run(["/bin/sh", script], check=True, timeout=30,
+        command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", script] if os.name == "nt" else ["/bin/sh", script]
+        subprocess.run(command, check=True, timeout=30,
                        cwd=self.root, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
 
@@ -183,9 +218,9 @@ class SwapTests(_Sandbox):
             return fh.read()
 
     def test_install_then_downgrade_round_trip(self):
-        self._write(self.app, "#!/bin/sh\n# OLD\nexit 0\n", True)
+        self._write(self.app, self._application_body("OLD"), True)
         new = self._write(os.path.join(self.root, "staged"),
-                          "#!/bin/sh\n# NEW\nexit 0\n", True)
+                          self._application_body("NEW"), True)
 
         script = updater.install(new, restart=False)
         self._run_swap(script)
@@ -205,7 +240,7 @@ class SwapTests(_Sandbox):
             updater.downgrade(restart=False)
 
     def test_install_records_the_version_being_replaced(self):
-        new = self._write(os.path.join(self.root, "staged"), "#!/bin/sh\n", True)
+        new = self._write(os.path.join(self.root, "staged"), self._application_body("NEW"), True)
         updater.install(new, restart=False)
         self.assertEqual(updater.previous_build_version(), updater.APP_VERSION)
 

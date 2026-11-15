@@ -63,7 +63,8 @@ class WindowsBuildSpecTests(unittest.TestCase):
     def test_bundles_three_distinct_windows_tools_from_default_directory(self):
         arguments, namespace = self._evaluate()
         self.assertEqual(arguments["binaries"], [
-            (str(self.tools / name), "platform-tools") for name in TOOL_NAMES])
+            (str((self.tools / name).resolve()), "platform-tools")
+            for name in TOOL_NAMES])
         self.assertFalse(namespace["EXE"].call_args.kwargs["upx"])
         self.assertEqual(namespace["collect_all"].call_count, 3)
 
@@ -71,8 +72,9 @@ class WindowsBuildSpecTests(unittest.TestCase):
         custom = self.root / "downloaded tools"
         self.tools.rename(custom)
         arguments, _ = self._evaluate(override=custom)
-        self.assertEqual({Path(source).parent for source, _ in arguments["binaries"]},
-                         {custom})
+        self.assertEqual({Path(source).parent.resolve()
+                          for source, _ in arguments["binaries"]},
+                         {custom.resolve()})
 
     def test_rejects_a_missing_dll(self):
         (self.tools / "AdbWinUsbApi.dll").unlink()

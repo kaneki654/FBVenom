@@ -17,6 +17,7 @@ mismatch deletes the file instead of installing it.
 import datetime
 import hashlib
 import json
+import ntpath
 import os
 import subprocess
 import sys
@@ -117,8 +118,16 @@ def _check_location(url, what):
     execution, and http is editable in transit by anyone on the way.
     """
     text = str(url or "")
+    # URL parsing treats an absolute Windows drive path as a one-letter
+    # scheme ("C:"). Check native paths before applying the network policy.
+    # A drive-relative path such as C:updates remains unsupported.
+    drive, tail = ntpath.splitdrive(text)
+    if (text.startswith("\\\\") or
+            (len(drive) == 2 and drive[0].isalpha() and drive[1] == ":"
+             and tail.startswith(("\\", "/")))):
+        return "local"
     parsed = urllib.parse.urlsplit(text)
-    if parsed.scheme in ("", "file") or text.startswith("\\\\"):
+    if parsed.scheme in ("", "file"):
         return "local"
     if parsed.scheme == "https":
         return "https"
