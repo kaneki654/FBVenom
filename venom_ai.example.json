@@ -1,0 +1,13 @@
+{
+  "provider": "groq",
+  "url": "https://api.groq.com/openai/v1/chat/completions",
+  "api_key": "",
+  "model": "groq/compound-mini",
+  "fallback_model": "qwen/qwen3.8-27b",
+  "min_gap": 4.0,
+  "tone": "neutral",
+  "temperature": 0.9,
+  "max_tokens": 40,
+  "timeout": 90,
+  "pollinations_token": ""
+}

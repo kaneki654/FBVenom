@@ -1,0 +1,27 @@
+# Python environments and generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local builds belong in GitHub Release assets
+/build/
+/dist/
+
+# Private settings and runtime data
+/venom_ai.json
+/venom_workspaces.json
+/venom_accounts.json
+/screenshots/
+/debug/
+*.log
+*.log.*
+.env
+.env.*
+!.env.example
+
+# Local editor and source backups
+*.bak
+*.bak.*
+*~
