@@ -209,9 +209,12 @@ class SwapTests(_Sandbox):
 
     def _run_swap(self, script):
         command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", script] if os.name == "nt" else ["/bin/sh", script]
-        subprocess.run(command, check=True, timeout=30,
-                       cwd=self.root, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
+        result = subprocess.run(command, check=False, timeout=30,
+                                cwd=self.root, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
+        self.assertEqual(result.returncode, 0,
+                         f"Swap failed ({result.returncode}).\n"
+                         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
 
     def _body(self, path):
         with open(path, "r", encoding="utf-8") as fh:

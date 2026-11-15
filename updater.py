@@ -278,7 +278,7 @@ def can_downgrade():
     return os.path.isfile(previous_build_path())
 
 
-def _swap_script(current, incoming, keep_as):
+def _swap_script(current, incoming, keep_as, relaunch=True):
     """A script that waits for this process to let go, then rotates the files.
 
     One shape serves both directions:
@@ -286,6 +286,7 @@ def _swap_script(current, incoming, keep_as):
     For an update `incoming` is the download and `keep_as` becomes the rollback
     target. For a downgrade `incoming` IS the rollback target, and the build
     being removed takes its place - so you can roll forward again.
+    `relaunch=False` rotates the files without starting the replacement app.
     """
     if os.name == "nt":
         path = os.path.join(APP_DIR, "fbvenom-swap.bat")
@@ -304,8 +305,10 @@ def _swap_script(current, incoming, keep_as):
             "if errorlevel 1 goto wait\r\n"
             'move /Y "%NEW%" "%CUR%" >nul 2>&1\r\n'
             'move /Y "%TMP%" "%KEEP%" >nul 2>&1\r\n'
-            'start "" "%CUR%"\r\n'
-            'del "%~f0" >nul 2>&1\r\n')
+            + ('start "" "%CUR%"\r\n' if relaunch else "")
+            # CMD must exit on the same parsed line that deletes this file;
+            # otherwise it can try rereading the deleted batch and fail.
+            + 'del "%~f0" >nul 2>&1 & exit /b 0\r\n')
     else:
         path = os.path.join(APP_DIR, "fbvenom-swap.sh")
         body = (
@@ -317,8 +320,8 @@ def _swap_script(current, incoming, keep_as):
             'mv -f "$NEW" "$CUR"\n'
             'mv -f "$TMP" "$KEEP"\n'
             'chmod +x "$CUR" 2>/dev/null\n'
-            '"$CUR" &\n'
-            'rm -f "$0"\n')
+            + ('"$CUR" &\n' if relaunch else "")
+            + 'rm -f "$0"\n')
     with open(path, "w", encoding="utf-8", newline="") as fh:
         fh.write(body)
     if os.name != "nt":
@@ -351,7 +354,7 @@ def install(staged_path, restart=True):
         save_settings(settings)
     except UpdateError:
         pass
-    script = _swap_script(APP_PATH, staged_path, previous_build_path())
+    script = _swap_script(APP_PATH, staged_path, previous_build_path(), relaunch=restart)
     if restart:
         _launch_detached(script)
     return script
@@ -362,7 +365,7 @@ def downgrade(restart=True):
     prev = previous_build_path()
     if not os.path.isfile(prev):
         raise UpdateError("There is no previous build on this PC to go back to.")
-    script = _swap_script(APP_PATH, prev, prev)
+    script = _swap_script(APP_PATH, prev, prev, relaunch=restart)
     if restart:
         _launch_detached(script)
     return script
