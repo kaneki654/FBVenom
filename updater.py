@@ -296,19 +296,21 @@ def _swap_script(current, incoming, keep_as, relaunch=True):
             f'set "CUR={current}"\r\n'
             f'set "NEW={incoming}"\r\n'
             f'set "KEEP={keep_as}"\r\n'
-            'set "TMP=%CUR%.swapping"\r\n'
+            'set "SWAP_TEMP=%CUR%.swapping"\r\n'
             ":wait\r\n"
-            "timeout /t 1 /nobreak >nul\r\n"
+            # timeout requires an interactive console and fails with the
+            # detached updater's redirected input. Loopback ping works there.
+            "ping -n 2 127.0.0.1 >nul 2>&1\r\n"
             # The move only succeeds once the old process has released the
             # file, so this doubles as "wait for exit" without guessing a PID.
-            'move /Y "%CUR%" "%TMP%" >nul 2>&1\r\n'
+            'move /Y "%CUR%" "%SWAP_TEMP%" >nul 2>&1\r\n'
             "if errorlevel 1 goto wait\r\n"
             'move /Y "%NEW%" "%CUR%" >nul 2>&1\r\n'
-            'move /Y "%TMP%" "%KEEP%" >nul 2>&1\r\n'
+            'move /Y "%SWAP_TEMP%" "%KEEP%" >nul 2>&1\r\n'
             + ('start "" "%CUR%"\r\n' if relaunch else "")
-            # CMD must exit on the same parsed line that deletes this file;
-            # otherwise it can try rereading the deleted batch and fail.
-            + 'del "%~f0" >nul 2>&1 & exit /b 0\r\n')
+            # Keep the helper: CMD may reread its executing batch after each
+            # command. The next update overwrites this file safely.
+            + 'exit /b 0\r\n')
     else:
         path = os.path.join(APP_DIR, "fbvenom-swap.sh")
         body = (
