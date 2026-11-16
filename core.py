@@ -1277,6 +1277,17 @@ SUSPENDED_MARKERS = (
 
 NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+
+class _NoLANRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # LAN mode sends credentials and comments only to the saved endpoint.
+        # Even a misconfigured gateway cannot redirect them to a public host.
+        return None
+
+
+LAN_NOPROXY = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoLANRedirect())
+
 # Rate limit comes from the provider preset: a hosted endpoint needs spacing,
 # a local Ollama does not. Read live so changing provider takes effect at once.
 def ai_min_gap():
@@ -1620,14 +1631,15 @@ def _fatal_ai_error(code, detail):
     return code == 400 and bool(_AI_FATAL_RE.search(detail or ""))
 
 
-def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None):
+def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None,
+               cfg=None):
     # Try the good model first; fall back to the small one only if the big one
     # is unavailable (rate limit / decommissioned), so a bad key or a busy
     # endpoint degrades instead of failing outright.
     # `prompt_text` may be a plain string or an OpenAI content-block list, which
     # is how an image rides along on the vision call - both go straight into the
     # user message.
-    cfg = ai_cfg()
+    cfg = ai_cfg() if cfg is None else cfg
     # venom_ai.json's "timeout" was ignored on the two call sites that matter -
     # generate_comment and _generate_context_comment pass no timeout, so every
     # comment used the 20s default no matter what the file said. A self-hosted
@@ -1681,7 +1693,8 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
             req = urllib.request.Request(
                 url, data=json.dumps(body).encode("utf-8"), headers=headers)
             try:
-                with NOPROXY.open(req, timeout=timeout) as resp:
+                opener = LAN_NOPROXY if aiconfig.get_server_mode(cfg) == "lan" else NOPROXY
+                with opener.open(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 return data["choices"][0]["message"]["content"]
             except urllib.error.HTTPError as e:
@@ -1689,6 +1702,8 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
                     detail = e.read().decode("utf-8", "replace")
                 except Exception:
                     detail = ""
+                finally:
+                    e.close()
                 last = RuntimeError(f"HTTP {e.code} on {mdl}: {detail[:200]}"
                                     if detail else f"HTTP {e.code} on {mdl}")
                 # No key, no credit, no quota: the fallback model shares the
@@ -1731,7 +1746,8 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
                 break
     raise last if last else RuntimeError("AI: no model available")
 
-def _pollinations_get(prompt_text, timeout=35, system=None, max_tokens=40):
+def _pollinations_get(prompt_text, timeout=35, system=None, max_tokens=40,
+                      cfg=None):
     # The old plain-text GET (text.pollinations.ai/<prompt>) now answers 402
     # "Payment Required" for anonymous callers - Pollinations deprecated it.
     # The keyless POST /openai endpoint still works, so route through it and
@@ -1741,7 +1757,7 @@ def _pollinations_get(prompt_text, timeout=35, system=None, max_tokens=40):
     # call that generate_comment makes right after this, so we don't hammer the
     # same throttled IP twice.
     return _pollinations_post(prompt_text, timeout=timeout, system=system,
-                              max_tokens=max_tokens, tries=1)
+                              max_tokens=max_tokens, tries=1, cfg=cfg)
 
 # Pollinations does not fail with an HTTP error when the account is out of
 # credits - it answers 200 OK and puts the apology in message.content:
@@ -1760,7 +1776,11 @@ _POLL_DEAD_RE = re.compile(
 _poll_dead = [False]
 
 
-def _pollinations_post(prompt_text, timeout=20, system=None, max_tokens=60, tries=2):
+def _pollinations_post(prompt_text, timeout=20, system=None, max_tokens=60,
+                       tries=2, cfg=None):
+    cfg = ai_cfg() if cfg is None else cfg
+    if aiconfig.get_server_mode(cfg) == "lan":
+        raise RuntimeError("External AI fallback is disabled in LAN mode")
     if _poll_dead[0]:
         raise RuntimeError("Pollinations is out of credits for this key")
     # Keyless, free, OpenAI-shaped. Only text.pollinations.ai/openai still
@@ -1776,7 +1796,7 @@ def _pollinations_post(prompt_text, timeout=20, system=None, max_tokens=60, trie
     #     users. Please migrate to https://enter.pollinations.ai" for any keyed
     #     request, so a token MUST go here or it can never work.
     #   * without one -> the legacy anonymous host, one request per 15s.
-    token = str(_ai("pollinations_token", "") or "").strip() or \
+    token = str(cfg.get("pollinations_token", "") or "").strip() or \
         os.environ.get("POLLINATIONS_TOKEN", "").strip()
     if token:
         url = "https://gen.pollinations.ai/v1/chat/completions"
@@ -3087,7 +3107,7 @@ def _spent_words(url=None):
 
 
 def _generate_context_comment(examples, ctx, retries=3, avoid_openings=None,
-                              tone=None):
+                              tone=None, cfg=None):
     """A comment about THIS post, typed in the examples' voice."""
     examples = [e for e in examples if e.strip()][:8]
     if not examples:
@@ -3187,7 +3207,7 @@ def _generate_context_comment(examples, ctx, retries=3, avoid_openings=None,
             return ""
         try:
             raw = _groq_chat(prompt_text, system=system_prompt,
-                             max_tokens=max_tok)
+                             max_tokens=max_tok, cfg=cfg)
             out = sanitize_comment(raw, "", style=style)
             if _good_context_comment(out, examples, ctx, style=style):
                 _claim_phrases(out)
@@ -3219,6 +3239,8 @@ def comment_examples_as_context(example):
 
 def generate_comment(example, retries=3, avoid_openings=None, tone=None,
                      ctx="", examples=None):
+    cfg = ai_cfg()
+    lan_only = aiconfig.get_server_mode(cfg) == "lan"
     example = example.strip()
     # `ctx` is what the post actually is, read once per link by post_context().
     # With it the job changes completely: the examples stop being the sentence
@@ -3230,7 +3252,7 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
         out = _generate_context_comment(examples or [example], ctx,
                                         retries=retries,
                                         avoid_openings=avoid_openings,
-                                        tone=tone)
+                                        tone=tone, cfg=cfg)
         if out:
             return out
         # A style that could not be satisfied must not cost us the POST. Drop
@@ -3243,7 +3265,7 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
             out = _generate_context_comment(examples or [example], ctx,
                                             retries=2,
                                             avoid_openings=avoid_openings,
-                                            tone="annoyed")
+                                            tone="annoyed", cfg=cfg)
             if out:
                 return out
         print("  [ai] context comment failed - rewording the example instead")
@@ -3325,10 +3347,10 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
         # threads against an endpoint that had already given its final answer.
         if _ai_is_off():
             return example
-        if GROQ_API_KEY:
+        if lan_only or str(cfg.get("api_key") or "").strip():
             try:
                 raw = _groq_chat(prompt_text, system=system_prompt,
-                                 max_tokens=max_tok)
+                                 max_tokens=max_tok, cfg=cfg)
                 out = sanitize_comment(raw, example)
                 if _good_variation(out, example):
                     return out
@@ -3338,9 +3360,11 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
                 continue
             except Exception as e_groq:
                 print(f"  [ai] Groq attempt {attempt+1} failed: {e_groq}")
+        if lan_only:
+            continue
         try:
             raw = _pollinations_get(prompt_text, system=system_prompt,
-                                    max_tokens=max_tok)
+                                    max_tokens=max_tok, cfg=cfg)
             out = sanitize_comment(raw, example)
             if _good_variation(out, example):
                 return out
@@ -3348,7 +3372,7 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
             print(f"  [ai] GET attempt {attempt+1} failed: {e_get}")
         try:
             raw = _pollinations_post(prompt_text, system=system_prompt,
-                                     max_tokens=max_tok)
+                                     max_tokens=max_tok, cfg=cfg)
             out = sanitize_comment(raw, example)
             if _good_variation(out, example):
                 return out
@@ -3359,24 +3383,30 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
     return example
 
 def ai_reply(prompt_text, system=None, max_tokens=90, retries=2):
+    cfg = ai_cfg()
+    lan_only = aiconfig.get_server_mode(cfg) == "lan"
     for _ in range(retries):
         if not _ai_wait_slot():
             return ""               # PURGE: don't start a fresh AI call
-        if GROQ_API_KEY:
+        if lan_only or str(cfg.get("api_key") or "").strip():
             try:
-                r = _groq_chat(prompt_text, system=system, max_tokens=max_tokens)
+                r = _groq_chat(prompt_text, system=system, max_tokens=max_tokens,
+                               cfg=cfg)
                 if r and r.strip():
                     return r
             except Exception:
                 pass
+        if lan_only:
+            continue
         try:
-            r = _pollinations_get(prompt_text, system=system)
+            r = _pollinations_get(prompt_text, system=system, cfg=cfg)
             if r and r.strip():
                 return r
         except Exception:
             pass
         try:
-            r = _pollinations_post(prompt_text, system=system, max_tokens=max_tokens)
+            r = _pollinations_post(prompt_text, system=system, max_tokens=max_tokens,
+                                   cfg=cfg)
             if r and r.strip():
                 return r
         except Exception:
@@ -3384,10 +3414,21 @@ def ai_reply(prompt_text, system=None, max_tokens=90, retries=2):
     return ""
 
 def start_llama():
-    if GROQ_API_KEY:
+    cfg = ai_cfg()
+    lan_only = aiconfig.get_server_mode(cfg) == "lan"
+    if lan_only or str(cfg.get("api_key") or "").strip():
+        if lan_only:
+            print("  [ai] Checking LAN AI gateway...")
+            try:
+                _groq_chat("hi", timeout=15, cfg=cfg)
+                print("  [ai] LAN AI gateway ready.")
+                return True
+            except Exception as e:
+                print(f"  [ai] LAN gateway check failed ({e}); external fallback is disabled.")
+                return False
         print("  [ai] Checking Groq AI (free tier)...")
         try:
-            _groq_chat("hi", timeout=15)
+            _groq_chat("hi", timeout=15, cfg=cfg)
             print("  [ai] Groq AI ready.")
             return True
         except Exception as e:
@@ -3405,7 +3446,7 @@ def start_llama():
     except Exception as e:
         print(f"  [ai] GET endpoint failed ({e}), trying POST fallback...")
         try:
-            _pollinations_post("hi", timeout=15)
+            _pollinations_post("hi", timeout=15, cfg=cfg)
             print("  [ai] Pollinations POST fallback ready.")
             return True
         except Exception as e2:
@@ -3646,19 +3687,33 @@ def _ai_is_off():
     """True while the AI must not be called: hard off, or cooling down."""
     return _ai_off[0] or time.time() < _ai_cold_until[0]
 
+
+def reset_ai_connection_state():
+    """Forget endpoint failures/pacing after an idle settings switch.
+
+    This does not generate a warm-up request or clear per-post comment history.
+    The GUI calls it only while no commenting session is running.
+    """
+    # A previous session's background probe can still hold _ai_http_lock
+    # during a slow request. Settings changes run on the GUI thread and must
+    # not wait for that network operation to finish.
+    with _used_lock:
+        _ai_fails[0] = 0
+        _ai_off[0] = False
+        _ai_cold_until[0] = 0.0
+        _ai_fatal_said[0] = False
+        _poll_dead[0] = False
+        _no_sampling.clear()
+    _poll_last_call[0] = 0.0
+    with _ai_slot_lock:
+        _ai_next_slot[0] = 0.0
+
+
 def reset_comment_pool():
     with _used_lock:
         _pool_by_link.clear()
         _example_turn[0] = 0
-        _ai_fails[0] = 0
-        _ai_off[0] = False
-        _ai_cold_until[0] = 0.0
-    # Re-test Pollinations on a new run: the user may have topped the token up.
-    _poll_dead[0] = False
-    # Say it again on the next run. The GUI stays open across runs, so without
-    # this a still-dead key reports itself once and every later run goes quiet
-    # for no visible reason - which is the confusion this message exists to end.
-    _ai_fatal_said[0] = False
+    reset_ai_connection_state()
     # A new run means new links, and an edited post gets read again.
     reset_post_context()
     # FIX 1b: wake the endpoint up BEFORE the phones need it. A cold

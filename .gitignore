@@ -16,6 +16,7 @@ venv/
 
 # Private settings and runtime data
 /venom_ai.json
+/.venom-ai-*.tmp
 /venom_workspaces.json
 /venom_accounts.json
 /screenshots/

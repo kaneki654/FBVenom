@@ -5,4 +5,4 @@ Every PC compares this number against the manifest to decide whether the
 Update button has anything to offer.
 """
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"

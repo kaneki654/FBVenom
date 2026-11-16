@@ -114,10 +114,51 @@ Presets, all OpenAI-compatible chat-completions endpoints:
 | Together AI | |
 | DeepSeek | |
 | Local (Ollama / LM Studio) | no key needed, no rate limit |
+| LAN gateway | separate LAN API key; private IPv4 address |
 | Custom endpoint | paste any compatible URL |
 
 **TEST** saves the settings and then really calls the endpoint, so a green
 result means comments will actually generate during a run.
+
+## Backup server and LAN mode
+
+Click **Backup server** beside **AI settings** while no session is running.
+The LAN gateway address starts at `http://192.168.100.129:7499/v1`, and a new
+LAN profile starts with your current model. On the gateway computer, the app
+automatically loads its private LAN key; **Load local key** reloads it if needed.
+This works only when the address belongs to this computer. Changing the gateway
+address clears the key so it cannot follow a different destination.
+
+On another computer, enter the separate LAN API key provided by the gateway's
+owner. The generated key is in `~/.config/aigw/lan.key` on the gateway machine;
+share it privately with intended clients. Do not use your primary provider's
+API key for the LAN gateway. Opening the gateway address in a browser shows
+connection instructions; API calls still need the LAN key.
+
+Click **Test connection** to check gateway readiness and load available models,
+choose a model, then click **Use LAN server**. That button checks the connection
+again before saving. The header identifies the active server and model.
+Checks run in the background; failed checks, edited drafts and checks completed
+after closing the dialog never change the active server.
+
+Click **Use primary server** to restore the previous provider, address, key,
+models and timing. The LAN profile is retained for the next switch. Both
+profiles persist in the private `venom_ai.json` file beside the app; writes are
+atomic and a failed save leaves the current configuration active. Switching
+providers in **AI settings** also keeps primary and LAN credentials separate.
+
+LAN mode sends AI requests only to the configured LAN gateway and refuses
+redirects. If that gateway fails, it uses the existing local comment fallback;
+it does not contact an external AI fallback provider. Server switches are
+blocked during a running session. HTTP is appropriate only on a trusted LAN;
+use HTTPS with a trusted certificate on other networks. The gateway computer
+must be powered on and reachable from the client subnet.
+
+Focused checks (no devices, posts, or external provider requests):
+
+```bash
+python -m unittest test_server_modes test_core_server_modes test_gui_server_modes -v
+```
 
 ## Sarcastic anger
 

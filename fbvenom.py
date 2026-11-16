@@ -108,6 +108,13 @@ def run_build_check():
         report["gui_features"]["venom_theme"] = (callable(getattr(gui, "draw_symbiote", None))
                                                     and hasattr(gui, "SymbioteBanner"))
         report["gui_features"]["diagnostics_panel"] = hasattr(gui.ReactionGUI, "_build_diagnostics")
+        report["gui_features"]["backup_server"] = (
+            callable(getattr(gui, "BackUpServ", None))
+            and callable(getattr(gui.ReactionGUI, "open_backup_server", None))
+            and callable(getattr(core, "reset_ai_connection_state", None))
+            and all(callable(getattr(aiconfig, name, None)) for name in (
+                "get_server_mode", "set_server_mode", "get_lan_profile",
+                "build_lan_profile", "validate_lan_connection", "get_local_lan_key")))
     except Exception as exc:
         report["imports"]["gui"] = False
         failed("GUI import/check", exc)
@@ -126,7 +133,8 @@ def run_build_check():
     checks["app_version"] = bool(report["app_version"])
     checks["imports"] = all(report["imports"].values())
     checks["updated_features"] = all(report["gui_features"].get(name, False) for name in (
-        "live_link_normalization", "structured_errors", "venom_theme", "diagnostics_panel"))
+        "live_link_normalization", "structured_errors", "venom_theme", "diagnostics_panel",
+        "backup_server"))
     report["failed_checks"] = [name for name, passed in checks.items() if not passed]
     report["ok"] = not report["failed_checks"] and not report["errors"]
     out = os.environ.get(

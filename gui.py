@@ -11,6 +11,7 @@ import queue
 import json
 import copy
 import subprocess
+from urllib.parse import urlsplit
 import aiconfig
 import updater
 from workspaces import WorkspaceStore
@@ -1718,6 +1719,7 @@ class AISettings(QDialog):
     def _load(self):
         cfg = aiconfig.load(force=True)
         prov = cfg.get("provider", "groq")
+        self._active_provider = prov
         if prov in self._keys:
             self.provider.blockSignals(True)
             self.provider.setCurrentIndex(self._keys.index(prov))
@@ -1732,7 +1734,21 @@ class AISettings(QDialog):
             self.tone.setCurrentIndex(self._tones.index(tone))
 
     def _preset_picked(self, idx):
-        p = aiconfig.PRESETS[self._keys[idx]]
+        name = self._keys[idx]
+        p = aiconfig.PRESETS[name]
+        if name == "lan":
+            profile = aiconfig.get_lan_profile()
+            p = {**p, "url": profile["url"], "model": profile["model"],
+                 "fallback": profile["fallback_model"], "min_gap": profile["min_gap"]}
+            self.key.setText(str(profile.get("api_key", "")))
+        elif getattr(self, "_active_provider", None) == "lan":
+            primary = aiconfig.load().get("primary_profile", {})
+            self.key.setText(str(primary.get("api_key", ""))
+                             if primary.get("provider") == name else "")
+            if primary.get("provider") == name:
+                p = {**p, "url": primary["url"], "model": primary["model"],
+                     "fallback": primary["fallback_model"], "min_gap": primary["min_gap"]}
+        self._active_provider = name
         self.url.setText(p["url"])
         self.model.setCurrentText(p["model"])
         self.fallback.setCurrentText(p["fallback"])
@@ -1788,15 +1804,22 @@ class AISettings(QDialog):
                 "tone": self._tones[self.tone.currentIndex()]}
 
     def _save(self):
-        cfg = aiconfig.load()
-        cfg.update(self._collect())
-        aiconfig.save(cfg)
+        try:
+            cfg = aiconfig.load()
+            cfg.update(self._collect())
+            aiconfig.save(cfg)
+        except Exception:
+            self._say("could not save settings · check the settings file permissions", C_BLOOD)
+            return False
+        fbcore.reset_ai_connection_state()
         self._say(f"saved  ·  {aiconfig.describe()}", C_TOXIC)
+        return True
 
     def _test(self):
         """Save first, then actually call the endpoint. A green result here
         means comments will really be generated during a run."""
-        self._save()
+        if not self._save():
+            return
         self._say("calling the endpoint…", C_MUTE)
         QApplication.processEvents()
         try:
@@ -1809,6 +1832,283 @@ class AISettings(QDialog):
         except Exception as e:
             self._say(f"FAILED  ·  {type(e).__name__}: {e}", C_BLOOD)
 
+
+class BackUpServ(QDialog):
+    """Verify the LAN gateway before replacing the active AI connection."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("BACKUP SERVER")
+        self.setMinimumWidth(640)
+        self.setStyleSheet(
+            f"QDialog{{background:{C_BG}}}"
+            f"QLabel{{color:{C_MUTE};font-family:'{F_UI}';font-size:12px;"
+            "background:transparent}" + _INPUT_QSS +
+            f"QComboBox{{background:{C_INPUT};color:{C_TEXT};border:1px solid {C_BORDER};"
+            f"border-radius:8px;padding:9px 12px;font-family:'{F_UI}';font-size:13px}}"
+            "QComboBox::drop-down{border:0;width:29px}"
+            "QComboBox::down-arrow{image:none}"
+            f"QComboBox QLineEdit{{background:transparent;color:{C_TEXT};border:0;padding:0}}"
+            f"QComboBox QAbstractItemView{{background:{C_CARD};color:{C_TEXT};"
+            f"selection-background-color:{C_TOXIC};selection-color:{C_VOID}}}")
+        self._busy = False
+        self._verified = False
+        self._closed = False
+        self._draft_revision = 0
+        self._results = queue.Queue()
+        load_failed = False
+        try:
+            cfg = aiconfig.load(force=True)
+            profile = aiconfig.get_lan_profile(cfg)
+        except Exception:
+            cfg = copy.deepcopy(aiconfig.DEFAULTS)
+            profile = aiconfig.get_lan_profile(cfg)
+            load_failed = True
+        self._mode = aiconfig.get_server_mode(cfg)
+
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(24, 22, 24, 20)
+        lo.setSpacing(14)
+        title = QLabel("BACKUP SERVER")
+        title.setStyleSheet(f"color:{C_TEXT};font-size:20px;font-weight:600;"
+                           f"font-family:'{F_DISP}';background:transparent")
+        lo.addWidget(title)
+        self.current_mode = QLabel()
+        self.current_mode.setStyleSheet(f"color:{C_TOXIC};font-weight:600")
+        lo.addWidget(self.current_mode)
+        intro = QLabel("Connect to your backup gateway on the same network. "
+                       "Your primary server settings are kept so you can switch back.")
+        intro.setWordWrap(True)
+        lo.addWidget(intro)
+
+        fields = QGridLayout()
+        fields.setHorizontalSpacing(14)
+        fields.setVerticalSpacing(12)
+        self.url = QLineEdit(str(profile.get("url", "")))
+        self.url.setAccessibleName("LAN gateway address")
+        self.url.setPlaceholderText("http://192.168.100.129:7499/v1")
+        fields.addWidget(QLabel("LAN address"), 0, 0)
+        fields.addWidget(self.url, 0, 1)
+        self.key = QLineEdit(str(profile.get("api_key", "")))
+        self.key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key.setAccessibleName("LAN API key")
+        self.key.setPlaceholderText("Separate API key from your LAN gateway")
+        self._key_origin = self._origin(self.url.text())
+        key_row = QHBoxLayout()
+        key_row.setSpacing(8)
+        key_row.addWidget(self.key, 1)
+        self.local_key_btn = GhostButton("Load local key")
+        self.local_key_btn.setToolTip("Load the saved key when this gateway runs on this computer")
+        self.local_key_btn.clicked.connect(self._load_local_key)
+        key_row.addWidget(self.local_key_btn)
+        fields.addWidget(QLabel("LAN API key"), 1, 0)
+        fields.addLayout(key_row, 1, 1)
+        self.model = PurpleComboBox()
+        self.model.setEditable(True)
+        self.model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.model.setMinimumHeight(42)
+        self.model.setAccessibleName("LAN model")
+        self.model.setCurrentText(str(profile.get("model", "llama-sea-lion")))
+        fields.addWidget(QLabel("Model"), 2, 0)
+        fields.addWidget(self.model, 2, 1)
+        fields.setColumnStretch(1, 1)
+        lo.addLayout(fields)
+        note = QLabel("Test connection loads the available models. LAN mode uses "
+                      "only this gateway. Use HTTP on a trusted network or HTTPS "
+                      "with a trusted certificate.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{C_FAINT};font-size:11px")
+        lo.addWidget(note)
+        self.status = QLabel("Gateway settings are ready. Test the connection or use LAN server."
+                             if self.key.text().strip() else
+                             "Enter the LAN API key, or load the key from this gateway computer.")
+        self.status.setWordWrap(True)
+        self.status.setMinimumHeight(48)
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        lo.addWidget(self.status)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.primary_btn = GhostButton("Use primary server")
+        self.primary_btn.clicked.connect(self._activate_primary)
+        row.addWidget(self.primary_btn)
+        row.addStretch()
+        self.test_btn = GhostButton("Test connection")
+        self.test_btn.clicked.connect(lambda: self._start_check(False))
+        row.addWidget(self.test_btn)
+        self.apply_btn = HazardButton("Use LAN server", C_TOXIC, primary=True, depth=0)
+        self.apply_btn.setMinimumSize(self.apply_btn.fontMetrics().horizontalAdvance(
+            self.apply_btn.text()) + 34, 40)
+        self.apply_btn.clicked.connect(lambda: self._start_check(True))
+        row.addWidget(self.apply_btn)
+        lo.addLayout(row)
+        close = GhostButton("Close")
+        close.clicked.connect(self.reject)
+        lo.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+
+        self.url.textChanged.connect(self._address_changed)
+        self.key.textChanged.connect(self._invalidate_verification)
+        self.model.currentTextChanged.connect(self._invalidate_verification)
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._drain)
+        self._poll.start(60)
+        self.finished.connect(self._on_finished)
+        self._refresh_mode()
+        if load_failed:
+            self.status.setText("Could not load saved server settings. Check the settings "
+                                "file before switching servers.")
+
+    def _refresh_mode(self):
+        self.current_mode.setText("LAN mode active" if self._mode == "lan"
+                                  else "Primary server active")
+        self._set_enabled(not self._busy)
+
+    def _set_enabled(self, enabled):
+        for widget in (self.url, self.key, self.model, self.local_key_btn,
+                       self.test_btn, self.apply_btn):
+            widget.setEnabled(enabled)
+        self.primary_btn.setEnabled(enabled and self._mode == "lan")
+
+    @staticmethod
+    def _origin(url):
+        try:
+            parsed = urlsplit(url.strip())
+            return parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError:
+            return None
+
+    def _address_changed(self, *_):
+        origin = self._origin(self.url.text())
+        if origin != self._key_origin:
+            # A key loaded for one gateway must not follow an address change.
+            self.key.clear()
+            self._key_origin = origin
+        self._invalidate_verification()
+
+    def _load_local_key(self):
+        if self._busy or self._closed:
+            return
+        key = aiconfig.get_local_lan_key(self.url.text())
+        if not key:
+            self.status.setText("No local key is available for this gateway. If it runs on "
+                                "another computer, enter the LAN key provided by its owner.")
+            return
+        self.key.setText(key)
+        self._key_origin = self._origin(self.url.text())
+        self.status.setText("LAN key loaded from this computer. Test the connection or use LAN server.")
+
+    def _invalidate_verification(self, *_):
+        self._draft_revision += 1
+        if self._verified:
+            self.status.setText("Settings changed. Test the connection again before switching.")
+        self._verified = False
+
+    def _can_switch(self):
+        if getattr(self.parent(), "running", False):
+            self.status.setText("Finish the session before switching servers.")
+            return False
+        return not self._closed
+
+    def _start_check(self, activate=False):
+        if self._busy or self._closed or (activate and not self._can_switch()):
+            return
+        try:
+            profile = aiconfig.build_lan_profile(
+                self.url.text(), self.key.text(), self.model.currentText())
+        except Exception:
+            self.status.setText("Check the LAN address, API key, and model. "
+                                "Use a private IPv4 address and the separate LAN key.")
+            return
+        self._busy = True
+        self._verified = False
+        self._set_enabled(False)
+        self.status.setText("Checking the LAN gateway and its available models…")
+        revision = self._draft_revision
+        results = self._results
+        validate = aiconfig.validate_lan_connection
+
+        def work():
+            # Only immutable draft data and this queue cross the thread boundary.
+            # Closing the dialog never allows a late worker to save settings.
+            try:
+                results.put(("ok", validate(profile), profile, activate, revision))
+            except Exception as exc:
+                results.put(("err", exc, profile, activate, revision))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _drain(self):
+        if self._closed:
+            return
+        try:
+            kind, value, profile, activate, revision = self._results.get_nowait()
+        except queue.Empty:
+            return
+        self._busy = False
+        self._set_enabled(True)
+        if revision != self._draft_revision:
+            self.status.setText("Settings changed during the check. Test the connection again.")
+            return
+        if kind == "err":
+            code = getattr(value, "code", None)
+            if code in (401, 403):
+                self.status.setText("LAN access was denied. Check the LAN API key "
+                                    "and that this computer is on the allowed network.")
+            else:
+                self.status.setText("Could not connect to the LAN gateway. Check the "
+                                    "address, key, network, and that the gateway is running.")
+            return
+        ids = [mid for mid in value if isinstance(mid, str) and mid]
+        if not ids:
+            self.status.setText("The LAN gateway returned no available models.")
+            return
+        selected = profile["model"]
+        self.model.blockSignals(True)
+        self.model.clear()
+        self.model.addItems(ids)
+        self.model.setCurrentText(selected if selected in ids else ids[0])
+        self.model.blockSignals(False)
+        self._verified = selected in ids
+        if not self._verified:
+            self.status.setText(f"Connected · {len(ids)} models available. "
+                                "Choose an available model, then use LAN server.")
+            return
+        if not activate:
+            self.status.setText(f"Connected · {len(ids)} models available. "
+                                "Use LAN server to switch.")
+            return
+        if self._can_switch():
+            self._save_mode("lan", profile)
+
+    def _activate_primary(self):
+        if not self._busy and self._can_switch():
+            self._save_mode("primary")
+
+    def _save_mode(self, mode, profile=None):
+        try:
+            if mode == "lan":
+                aiconfig.set_server_mode(mode, profile)
+            else:
+                aiconfig.set_server_mode(mode)
+        except Exception:
+            self.status.setText("Could not save server settings. Your active server "
+                                "has not changed. Check the settings file permissions.")
+            return
+        fbcore.reset_ai_connection_state()
+        self._mode = mode
+        self._refresh_mode()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "refresh_ai_status"):
+            try:
+                parent.refresh_ai_status()
+            except Exception:
+                pass  # The connection has already been saved successfully.
+        self.status.setText("LAN mode enabled. Requests now use your LAN gateway."
+                            if mode == "lan" else "Primary server restored.")
+
+    def _on_finished(self, *_):
+        self._closed = True
+        self._poll.stop()
 
 class UpdateDialog(QDialog):
     """Install a published build, or go back to the one it replaced.
@@ -1840,6 +2140,7 @@ class UpdateDialog(QDialog):
         title.setStyleSheet(f"color:{C_TEXT};font-size:20px;font-weight:600;"
                             f"font-family:'{F_DISP}';background:transparent")
         lo.addWidget(title)
+
 
         self.installed = QLabel(f"Installed version  {updater.APP_VERSION}")
         self.installed.setStyleSheet(
@@ -2158,6 +2459,9 @@ class ReactionGUI(QMainWindow):
         self.ai_btn.setFixedWidth(136)
         self.ai_btn.setToolTip("Configure your AI provider, model, and comment tone")
         self.ai_btn.clicked.connect(self.open_ai_settings)
+        self.backup_btn = GhostButton("Backup server")
+        self.backup_btn.setToolTip("Switch between the primary AI server and your LAN gateway")
+        self.backup_btn.clicked.connect(self.open_backup_server)
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
         buttons.addStretch()
@@ -2166,6 +2470,7 @@ class ReactionGUI(QMainWindow):
                                    "the previous one")
         self.update_btn.clicked.connect(self.open_updates)
         buttons.addWidget(self.update_btn)
+        buttons.addWidget(self.backup_btn)
         buttons.addWidget(self.ai_btn)
         ai.addLayout(buttons)
         self.ai_status = QLabel("")
@@ -2945,6 +3250,7 @@ class ReactionGUI(QMainWindow):
         self.dose_rate.setEnabled(idle and configured)
         self.screenshot_check.setEnabled(idle and configured)
         self.ai_btn.setEnabled(idle)
+        self.backup_btn.setEnabled(idle)
         self.start_btn.setEnabled(idle and configured)
         self.stop_btn.setEnabled(self.running and not self.stop_flag)
 
@@ -3346,8 +3652,18 @@ class ReactionGUI(QMainWindow):
 
     def open_ai_settings(self):
         """Open the endpoint editor, then refresh the little status caption."""
+        if self.running:
+            self.send_cmd({"action": "toast", "text": "Finish the session before changing AI settings"})
+            return
         dlg = AISettings(self)
         dlg.exec()
+        self.refresh_ai_status()
+
+    def open_backup_server(self):
+        if self.running:
+            self.send_cmd({"action": "toast", "text": "Finish the session before switching servers"})
+            return
+        BackUpServ(self).exec()
         self.refresh_ai_status()
 
     def refresh_ai_status(self):

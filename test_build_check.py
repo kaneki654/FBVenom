@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import fbvenom
+import tools_validate_windows_build as build_validator
 
 
 class BuildCheckTests(unittest.TestCase):
@@ -28,12 +29,18 @@ class BuildCheckTests(unittest.TestCase):
         pixmap = SimpleNamespace(isNull=lambda: False, width=lambda: 256, height=lambda: 256)
         gui = SimpleNamespace(
             app_icon_pixmap=Mock(return_value=pixmap), draw_symbiote=lambda: None,
-            SymbioteBanner=object, ReactionGUI=SimpleNamespace(_build_diagnostics=object))
+            SymbioteBanner=object,
+            BackUpServ=Mock(side_effect=AssertionError("packaging must not instantiate the server dialog")),
+            ReactionGUI=SimpleNamespace(_build_diagnostics=object, open_backup_server=lambda: None))
         self.modules = {
             "version": SimpleNamespace(APP_VERSION="1.1.1"),
-            "aiconfig": SimpleNamespace(CONFIG_PATH=str(self.app / "venom_ai.json")),
+            "aiconfig": SimpleNamespace(CONFIG_PATH=str(self.app / "venom_ai.json"), **{
+                name: Mock(side_effect=AssertionError("packaging must not access server settings"))
+                for name in ("get_server_mode", "set_server_mode", "get_lan_profile",
+                             "build_lan_profile", "validate_lan_connection", "get_local_lan_key")}),
             "core": SimpleNamespace(HERE=str(self.app), ADB=str(self.adb),
-                                    normalize_url=self.normalize, report_error=lambda: None),
+                                    normalize_url=self.normalize, report_error=lambda: None,
+                                    reset_ai_connection_state=lambda: None),
             "PIL": SimpleNamespace(Image=SimpleNamespace(__version__="test")),
             "PyQt6.QtWidgets": SimpleNamespace(QApplication=SimpleNamespace(instance=lambda: object())),
             "gui": gui,
@@ -71,6 +78,10 @@ class BuildCheckTests(unittest.TestCase):
         self.assertTrue(report["auth_imported"])
         self.assertTrue(all(report["gui_features"].values()))
         self.require_key.assert_not_called()
+        self.modules["gui"].BackUpServ.assert_not_called()
+        for name in ("get_server_mode", "set_server_mode", "get_lan_profile",
+                     "build_lan_profile", "validate_lan_connection", "get_local_lan_key"):
+            getattr(self.modules["aiconfig"], name).assert_not_called()
         self.assertFalse((self.app / "venom_ai.json").exists())
         args, kwargs = self.adb_run.call_args
         self.assertEqual(args[0], [str(self.adb), "version"])
@@ -118,6 +129,48 @@ class BuildCheckTests(unittest.TestCase):
             self.assertEqual(fbvenom.run_build_check(), 2)
         self.assertFalse(self.report()["gui_features"]["diagnostics_panel"])
         self.assertIn("updated_features", self.report()["failed_checks"])
+
+    def test_backup_server_requires_dialog_handler_state_reset_and_mode_helpers(self):
+        required = (("gui", "BackUpServ"), ("core", "reset_ai_connection_state"),
+                    ("aiconfig", "get_server_mode"), ("aiconfig", "set_server_mode"))
+        for module, name in required:
+            with self.subTest(module=module, name=name), patch.object(self.modules[module], name, None):
+                self.assertEqual(fbvenom.run_build_check(), 2)
+                self.assertFalse(self.report()["gui_features"]["backup_server"])
+                self.assertIn("updated_features", self.report()["failed_checks"])
+        with patch.object(self.modules["gui"].ReactionGUI, "open_backup_server", None):
+            self.assertEqual(fbvenom.run_build_check(), 2)
+            self.assertFalse(self.report()["gui_features"]["backup_server"])
+
+
+class WindowsBuildFeatureValidationTests(unittest.TestCase):
+    def test_validator_rejects_missing_backup_feature_even_when_report_claims_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "FBVenom.exe"
+            path.write_bytes(b"mock executable")
+            report = {
+                "ok": True, "app_version": "1.1.1", "adb_version": "test adb",
+                **{name: True for name in ("frozen", "windows", "adb_bundled", "adb_version_ok",
+                   "icon_loaded", "config_beside_exe", "app_beside_exe", "auth_imported")},
+                "gui_features": {name: True for name in ("live_link_normalization", "structured_errors",
+                    "venom_theme", "diagnostics_panel")},
+            }
+            def frozen_check(*args, **kwargs):
+                Path(kwargs["env"]["FBVENOM_BUILD_CHECK_PATH"]).write_text(json.dumps(report), encoding="utf-8")
+                return SimpleNamespace(returncode=0)
+            with patch.object(sys, "platform", "win32"), \
+                    patch.object(build_validator, "windows_pe_info", return_value={}), \
+                    patch.object(build_validator.subprocess, "run", side_effect=frozen_check), \
+                    patch.dict(sys.modules, {"version": SimpleNamespace(APP_VERSION="1.1.1")}):
+                with self.assertRaisesRegex(RuntimeError, "required application features"):
+                    build_validator.validate(path, "source-commit")
+                report["gui_features"]["backup_server"] = False
+                with self.assertRaisesRegex(RuntimeError, "required application features"):
+                    build_validator.validate(path, "source-commit")
+                report["gui_features"]["backup_server"] = True
+                validated = build_validator.validate(path, "source-commit")
+                self.assertTrue(validated["gui_features"]["backup_server"])
+                self.assertEqual(validated["source_commit"], "source-commit")
 
 
 if __name__ == "__main__":

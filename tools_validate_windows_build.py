@@ -63,6 +63,11 @@ def validate(path, source_commit):
                 "config_beside_exe", "app_beside_exe", "auth_imported")
     if not all(smoke.get(key) is True for key in required):
         raise RuntimeError("Frozen startup omitted required packaging checks.")
+    features = smoke.get("gui_features", {})
+    if not isinstance(features, dict) or not all(features.get(name) is True for name in (
+            "live_link_normalization", "structured_errors", "venom_theme", "diagnostics_panel",
+            "backup_server")):
+        raise RuntimeError("Frozen startup omitted required application features.")
     if smoke.get("app_version") != APP_VERSION:
         raise RuntimeError("The executable version does not match version.py.")
     digest = sha256_file(path)
@@ -73,7 +78,7 @@ def validate(path, source_commit):
         "sha256": digest, **info,
         "windows_smoke_test": "passed",
         "checks": {key: smoke[key] for key in required},
-        "gui_features": smoke.get("gui_features", {}),
+        "gui_features": features,
         "adb_version": smoke.get("adb_version", "").splitlines()[0],
         "workflow_run": (f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
                          f"{os.environ['GITHUB_RUN_ID']}" if os.environ.get("GITHUB_RUN_ID") else ""),
