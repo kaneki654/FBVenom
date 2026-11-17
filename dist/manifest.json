@@ -1,8 +1,8 @@
 {
-  "version": "1.1.5",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.5/FBVenom.exe",
-  "sha256": "ba1d69dc0b0685fadb421b641a56dd455522df2f6cf31cb10d70d4bf5380641b",
-  "notes": "Faster AI comments: when the AI reuses words it shouldn't, the retry is told exactly which words to avoid, so more comments pass on the first method with fewer AI calls (tested: 90% vs 71%). Includes 1.1.4: USB internet button and instant fallback when the AI server is down.",
-  "size": 68273665,
-  "published": "2026-11-17T05:57:02+00:00"
+  "version": "1.1.6",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.6/FBVenom.exe",
+  "sha256": "0eca454a3b7043f28c5db5a31f48f0bf919caa11369aad9bbe5d5b0b34ee0cdc",
+  "notes": "Fixes comments that were typed but never sent: Send is now found on every phone (gesture navigation, keyboard up or down, long comments), and posts in the new 'Comment as <name>' and Taglish layouts are counted correctly. Failed sends now save the screen to the debug folder.",
+  "size": 68276040,
+  "published": "2026-11-17T07:08:09+00:00"
 }
