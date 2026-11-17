@@ -1,8 +1,8 @@
 {
-  "version": "1.1.4",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.4/FBVenom.exe",
-  "sha256": "900f73156dd9727bb8ec0b299779550865a1d40cdc14e6af9d4f79a3315930a9",
-  "notes": "New USB internet button: share this PC's internet with every phone on a USB cable (one click, VPN prompt auto-approved, error log). Faster AI comments: written while the post opens, reused connections, and instant fallback with clear Diagnostics when the AI server is down.",
-  "size": 68272202,
-  "published": "2026-11-17T05:16:35+00:00"
+  "version": "1.1.5",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.5/FBVenom.exe",
+  "sha256": "ba1d69dc0b0685fadb421b641a56dd455522df2f6cf31cb10d70d4bf5380641b",
+  "notes": "Faster AI comments: when the AI reuses words it shouldn't, the retry is told exactly which words to avoid, so more comments pass on the first method with fewer AI calls (tested: 90% vs 71%). Includes 1.1.4: USB internet button and instant fallback when the AI server is down.",
+  "size": 68273665,
+  "published": "2026-11-17T05:57:02+00:00"
 }
