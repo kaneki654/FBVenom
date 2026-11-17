@@ -187,6 +187,13 @@ python -m unittest test_server_modes test_core_server_modes test_gui_server_mode
 
 ## AI connection speed and outages
 
+When a styled comment is rejected for reusing the examples' stand-out words
+(or a word already used up under that post), the retry is told exactly which
+words to avoid, and the list grows with each retry. Measured on 21 comments per
+variant against the live endpoint: first-method success rose from 71% to 90%,
+rejected attempts fell 42%, and AI calls per comment fell from 2.2 to 1.7. The
+quality rules themselves are unchanged.
+
 Comments are composed **while the phone opens the post**, not after it, so the
 AI round trip is hidden behind the phone's own loading time. AI requests reuse
 their HTTPS connection instead of opening a new one each time (measured
