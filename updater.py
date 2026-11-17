@@ -16,12 +16,16 @@ mismatch deletes the file instead of installing it.
 
 import datetime
 import hashlib
+import email.utils
 import json
 import ntpath
 import os
 import subprocess
+import ssl
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -39,6 +43,8 @@ else:
 SETTINGS_PATH = os.path.join(APP_DIR, "venom_update.json")
 MAX_DOWNLOAD = 400 * 1024 * 1024       # a build is ~45MB; this is a sanity cap
 MAX_MANIFEST = 64 * 1024
+MAX_HTTP_ATTEMPTS = 3
+_RETRY_HTTP_STATUSES = frozenset((429, 500, 502, 503, 504))
 
 # The permanent home of the published build.
 #
@@ -140,12 +146,110 @@ def _local_path(url):
     return url[7:] if str(url).startswith("file://") else str(url)
 
 
+def _safe_location(url):
+    """Show a useful address without userinfo, query tokens or fragments."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url))
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            return "the local update file"
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        try:
+            if parsed.port is not None:
+                host += f":{parsed.port}"
+        except ValueError:
+            pass
+        safe = urllib.parse.urlunsplit(("https", host, parsed.path or "/", "", ""))
+        return "".join(c for c in safe if ord(c) >= 32 and ord(c) != 127)
+    except ValueError:
+        return "the configured update address"
+
+
+class _HTTPSOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if urllib.parse.urlsplit(target).scheme.lower() != "https":
+            # urllib normally closes this response only after constructing the
+            # redirected request. A refusal must close it here instead.
+            fp.close()
+            raise UpdateError("The update was redirected to a non-HTTPS address and was refused.")
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
+_HTTPS_OPENER = urllib.request.build_opener(_HTTPSOnlyRedirect())
+
+
+def _retry_delay(headers, attempt):
+    fallback = min(0.25 * (2 ** (attempt - 1)), 2.0)
+    value = headers.get("Retry-After") if headers else None
+    if value is None:
+        return fallback
+    try:
+        delay = float(value)
+    except (ValueError, TypeError):
+        try:
+            until = email.utils.parsedate_to_datetime(value)
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=datetime.timezone.utc)
+            delay = (until - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return fallback
+    # NaN and infinity must not become unbounded or invalid sleeps.
+    if not 0 <= delay <= 2:
+        return 2.0 if delay > 2 else 0.0 if delay < 0 else fallback
+    return delay
+
+
+def _open_https(url, timeout, accept):
+    """Retry transient HTTP failures at this exact channel, keeping TLS enabled."""
+    location = _safe_location(url)
+    for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
+        request = urllib.request.Request(url, headers={
+            "Accept": accept, "User-Agent": "FBVenom-Updater/" + APP_VERSION})
+        try:
+            response = _HTTPS_OPENER.open(request, timeout=timeout)
+            try:
+                _require_https_final(response)
+            except BaseException:
+                response.close()
+                raise
+            return response
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+            delay = _retry_delay(exc.headers, attempt)
+            exc.close()
+            if code in _RETRY_HTTP_STATUSES and attempt < MAX_HTTP_ATTEMPTS:
+                time.sleep(delay)
+                continue
+            if code == 404:
+                advice = "The requested update file is not published at that address."
+            elif code in _RETRY_HTTP_STATUSES:
+                advice = f"The server is temporarily unavailable after {attempt} attempts; try again later."
+            else:
+                advice = "Check the update address and access to its published release."
+            raise UpdateError(f"Update server returned HTTP {code} at {location}. {advice}") from None
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                message = "TLS certificate verification failed; the update connection was refused"
+            elif isinstance(exc.reason, TimeoutError):
+                message = "The update connection timed out"
+            else:
+                message = "Could not reach the update server; check the network connection"
+            raise UpdateError(f"{message} at {location}.") from None
+        except TimeoutError:
+            raise UpdateError(f"The update connection timed out at {location}.") from None
+        except ssl.SSLCertVerificationError:
+            raise UpdateError(f"TLS certificate verification failed at {location}; the update was refused.") from None
+        except OSError:
+            raise UpdateError(f"Could not reach the update server at {location}; check the network connection.") from None
+
+
 def _read(url, limit):
     if _check_location(url, "The update address") == "local":
         with open(_local_path(url), "rb") as fh:
             return fh.read(limit + 1)
-    with urllib.request.urlopen(url, timeout=20) as response:  # nosec B310 - scheme checked above
-        _require_https_final(response)
+    with _open_https(url, timeout=20, accept="application/json") as response:
         return response.read(limit + 1)
 
 
@@ -178,14 +282,14 @@ def fetch_manifest(url):
         raw = _read(url, MAX_MANIFEST)
     except UpdateError:
         raise
-    except Exception as exc:
-        raise UpdateError(f"Could not reach the update address: {exc}") from exc
+    except Exception:
+        raise UpdateError(f"Could not read the update manifest at {_safe_location(url)}; check that the file is available.") from None
     if len(raw) > MAX_MANIFEST:
         raise UpdateError("That address did not answer with an update manifest.")
     try:
         data = json.loads(raw.decode("utf-8"))
-    except Exception as exc:
-        raise UpdateError(f"The update manifest is not valid JSON: {exc}") from exc
+    except Exception:
+        raise UpdateError(f"The update manifest at {_safe_location(url)} is not valid JSON.") from None
     if not isinstance(data, dict):
         raise UpdateError("The update manifest must be a JSON object.")
 
@@ -224,15 +328,17 @@ def download(manifest, progress=None):
     digest = hashlib.sha256()
     total = 0
     kind = _check_location(manifest["url"], "The download address")
-    fd, staged = tempfile.mkstemp(prefix=".fbvenom-update-", dir=APP_DIR)
+    try:
+        fd, staged = tempfile.mkstemp(prefix=".fbvenom-update-", dir=APP_DIR)
+    except OSError:
+        raise UpdateError("Could not stage the update; check that the application folder is writable and has free space.") from None
     os.close(fd)
     try:
         if kind == "local":
             stream = open(_local_path(manifest["url"]), "rb")
             size = os.path.getsize(_local_path(manifest["url"]))
         else:
-            stream = urllib.request.urlopen(manifest["url"], timeout=60)  # nosec B310 - scheme checked
-            _require_https_final(stream)
+            stream = _open_https(manifest["url"], timeout=60, accept="application/octet-stream")
             try:
                 size = int(stream.headers.get("Content-Length") or 0)
             except Exception:
@@ -255,12 +361,14 @@ def download(manifest, progress=None):
                 "The download does not match the checksum in the manifest, so "
                 "it was discarded. Re-publish the build and try again.")
         return staged
-    except Exception:
+    except Exception as exc:
         try:
             os.unlink(staged)
         except OSError:
             pass
-        raise
+        if isinstance(exc, UpdateError):
+            raise
+        raise UpdateError(f"Could not download the update from {_safe_location(manifest['url'])}; check the connection and available disk space.") from None
 
 
 # ── installing and rolling back ────────────────────────────────────────────

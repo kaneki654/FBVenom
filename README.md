@@ -98,6 +98,24 @@ remain editable. Keep it beside the EXE for the current settings, or launch the
 EXE without it and configure AI SETTINGS on first use. Never distribute your
 personal `venom_ai.json` with a public copy of the EXE.
 
+## App updates
+
+Open **Updates** and click **Check for update**. The default address is
+`https://github.com/kaneki654/FBVenom/releases/latest/download/manifest.json`.
+It serves a published GitHub Release, so pushing source or an executable to
+`main` alone does not create an update. Each manifest points to that release's
+version-specific executable and its SHA-256 checksum. Temporary HTTP server
+errors are retried up to three times; a missing release is reported as HTTP 404.
+Closing while an update check or download is pending cancels that action.
+
+For maintainers, bump `version.py` before the Windows build, download its
+verified executable/build report/checksum, and prepare the manifest with
+`tools_publish_update.py dist/FBVenom.exe --version <built-version>`. The publisher refuses
+version, checksum, size, format and startup-verification mismatches. Commit
+the four `dist/` release files to `main`; **Publish verified Windows update**
+validates them, uploads all assets to a draft release, then publishes it.
+The workflow can also be run manually to resume an interrupted publication.
+
 ## AI settings
 
 Click **⚗ AI SETTINGS** in the command bar. The caption beside it shows the

@@ -2111,12 +2111,7 @@ class BackUpServ(QDialog):
         self._poll.stop()
 
 class UpdateDialog(QDialog):
-    """Install a published build, or go back to the one it replaced.
-
-    Network work runs on a worker thread and reports through a polled result
-    slot rather than Qt signals - the same queue-and-timer shape the main
-    window already uses, so there is one concurrency pattern in this file.
-    """
+    """Check and stage updates without touching Qt widgets from a worker."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2125,36 +2120,34 @@ class UpdateDialog(QDialog):
         self.setStyleSheet(
             f"QDialog{{background:{C_BG}}}"
             f"QLabel{{color:{C_MUTE};font-family:'{F_UI}';font-size:12px;"
-            "background:transparent}"
-            + _INPUT_QSS)
+            "background:transparent}" + _INPUT_QSS)
         self._busy = False
-        self._result = None
+        self._closed = False
         self._manifest = None
         self._staged = None
+        self._results = queue.Queue()
+        self._result_lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._revision = 0
+        self._restart_pending = False
+        self._stage_dir = os.path.abspath(updater.APP_DIR)
 
         lo = QVBoxLayout(self)
         lo.setContentsMargins(24, 22, 24, 20)
         lo.setSpacing(14)
-
         title = QLabel("Updates")
         title.setStyleSheet(f"color:{C_TEXT};font-size:20px;font-weight:600;"
-                            f"font-family:'{F_DISP}';background:transparent")
+                           f"font-family:'{F_DISP}';background:transparent")
         lo.addWidget(title)
-
-
         self.installed = QLabel(f"Installed version  {updater.APP_VERSION}")
-        self.installed.setStyleSheet(
-            f"color:{C_TEXT};font-size:13px;background:transparent")
+        self.installed.setStyleSheet(f"color:{C_TEXT};font-size:13px;background:transparent")
         lo.addWidget(self.installed)
-
         lo.addWidget(self._label("UPDATE ADDRESS"))
-        # Pre-filled with the permanent release channel, so a fresh PC has
-        # nothing to type. Still editable if the channel ever moves.
         self.url = QLineEdit(updater.load_settings().get("manifest_url", ""))
         self.url.setAccessibleName("Update address")
         lo.addWidget(self.url)
-
         self.status = QLabel("Check whether a newer build has been published.")
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
         self.status.setMinimumHeight(48)
         lo.addWidget(self.status)
@@ -2174,7 +2167,9 @@ class UpdateDialog(QDialog):
         self.back_btn.setEnabled(updater.can_downgrade())
         row.addWidget(self.back_btn)
         lo.addLayout(row)
-
+        close = GhostButton("Close")
+        close.clicked.connect(self.reject)
+        lo.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
         if updater.can_downgrade():
             was = updater.previous_build_version()
             self.status.setText(
@@ -2184,85 +2179,198 @@ class UpdateDialog(QDialog):
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._drain)
         self._poll.start(120)
+        self._restart_timer = QTimer(self)
+        self._restart_timer.setSingleShot(True)
+        self._restart_timer.timeout.connect(self._quit_after_install)
+        self.url.textChanged.connect(self._address_changed)
+        self.finished.connect(self._on_finished)
 
     def _label(self, text):
-        lab = QLabel(text)
-        lab.setStyleSheet(_FIELD_LBL)
-        return lab
+        label = QLabel(text)
+        label.setStyleSheet(_FIELD_LBL)
+        return label
 
-    # ── worker plumbing ────────────────────────────────────────────────
-    def _run(self, fn):
-        """Run one network step off the UI thread; _drain picks up the result."""
-        if self._busy:
+    @staticmethod
+    def _discard_staged(path, directory):
+        """Delete only a returned updater temporary, never an arbitrary path."""
+        import stat
+        try:
+            path = os.path.abspath(os.fspath(path))
+            if (not os.path.basename(path).startswith(".fbvenom-update-")
+                    or os.path.realpath(os.path.dirname(path)) != os.path.realpath(directory)):
+                return
+            info = os.lstat(path)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
+                return
+            os.unlink(path)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def _run(self, step, operation):
+        if self._busy or self._closed or self._restart_pending:
             return
         self._busy = True
         self._set_enabled(False)
+        self._cancel = threading.Event()
+        cancel, results, lock = self._cancel, self._results, self._result_lock
+        revision, stage_dir = self._revision, self._stage_dir
+        discard = self._discard_staged
+
+        def report(done, total):
+            if cancel.is_set():
+                # updater.download owns and removes its partial file when a
+                # progress callback raises. No widget is touched here.
+                raise updater.UpdateError("Update cancelled.")
+            results.put(("progress", step, (done, total), revision))
 
         def work():
             try:
-                self._result = ("ok", fn())
-            except Exception as exc:                  # shown, never raised
-                self._result = ("err", exc)
+                payload = operation(report)
+                kind = "ok"
+            except Exception as exc:
+                payload, kind = exc, "err"
+            # Serialize publication with closing: either close drains the
+            # queued temporary or this worker discards the late result.
+            with lock:
+                if cancel.is_set():
+                    if kind == "ok" and step == "download":
+                        discard(payload, stage_dir)
+                    return
+                results.put((kind, step, payload, revision))
+
         threading.Thread(target=work, daemon=True).start()
 
-    def _set_enabled(self, on):
-        self.check_btn.setEnabled(on)
-        self.install_btn.setEnabled(on and self._manifest is not None)
-        self.back_btn.setEnabled(on and updater.can_downgrade())
+    def _set_enabled(self, enabled):
+        enabled = enabled and not self._closed and not self._restart_pending
+        self.url.setEnabled(enabled)
+        self.check_btn.setEnabled(enabled)
+        self.install_btn.setEnabled(enabled and self._manifest is not None)
+        self.back_btn.setEnabled(enabled and updater.can_downgrade())
+
+    def _address_changed(self, *_):
+        self._revision += 1
+        self._manifest = None
+        self.install_btn.setEnabled(False)
+        if not self._busy and not self._closed:
+            self.status.setText("Update address changed. Check for an update again.")
+
+    @staticmethod
+    def _error_text(error):
+        if isinstance(error, updater.UpdateError):
+            return str(error)
+        return "Could not complete the update. Check the update address and try again."
 
     def _drain(self):
-        if self._result is None:
+        if self._closed:
             return
-        kind, payload = self._result
-        self._result = None
-        self._busy = False
-        if kind == "err":
-            self._set_enabled(True)
-            self.status.setText(str(payload))
-            return
-        self._finish(payload)
+        while True:
+            try:
+                kind, step, payload, revision = self._results.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "progress":
+                if revision == self._revision and self._busy:
+                    done, total = payload
+                    if total and total > 0:
+                        percent = max(0, min(100, int(done * 100 // total)))
+                        self.status.setText(f"Downloading… {percent}%")
+                    else:
+                        self.status.setText(f"Downloading… {max(0, int(done)) // 1024} KB")
+                continue
+            self._busy = False
+            if revision != self._revision:
+                if kind == "ok" and step == "download":
+                    self._discard_staged(payload, self._stage_dir)
+                self.status.setText("Update address changed. Check for an update again.")
+                self._set_enabled(True)
+                continue
+            if kind == "err":
+                self.status.setText(self._error_text(payload))
+                self._set_enabled(True)
+                continue
+            self._finish((step, payload))
 
     def _finish(self, payload):
         step, value = payload
+        if self._closed:
+            if step == "download":
+                self._discard_staged(value, self._stage_dir)
+            return
         if step == "check":
             manifest, available = value
+            self._manifest = manifest if available else None
             if available:
-                self._manifest = manifest
-                notes = f"\n{manifest['notes']}" if manifest["notes"] else ""
-                self.status.setText(
-                    f"Version {manifest['version']} is available "
-                    f"(you have {updater.APP_VERSION}).{notes}")
+                notes = f"\n{manifest['notes']}" if manifest.get("notes") else ""
+                self.status.setText(f"Version {manifest['version']} is available "
+                                    f"(you have {updater.APP_VERSION}).{notes}")
             else:
-                self._manifest = None
-                self.status.setText(
-                    f"You already have the newest build "
-                    f"({manifest['version']}).")
+                self.status.setText(f"You already have the newest build ({manifest['version']}).")
             self._set_enabled(True)
         elif step == "download":
             self._staged = value
-            self.status.setText("Download verified. Restarting into the new "
-                                "build…")
-            updater.install(self._staged)
-            QTimer.singleShot(400, QApplication.quit)
+            try:
+                updater.install(value)
+            except Exception as exc:
+                self._discard_staged(value, self._stage_dir)
+                self._staged = None
+                self.status.setText(self._error_text(exc))
+                self._set_enabled(True)
+                return
+            self._staged = None  # The installer now owns this verified file.
+            self.status.setText("Download verified. Restarting into the new build…")
+            self._restart_pending = True
+            self._set_enabled(False)
+            self._restart_timer.start(400)
 
-    # ── actions ────────────────────────────────────────────────────────
+    def _quit_after_install(self):
+        if self._restart_pending:
+            QApplication.quit()
+
+    def _on_finished(self, *_):
+        if self._closed:
+            return
+        self._closed = True
+        self._busy = False
+        self._poll.stop()
+        # Once the swap helper has accepted the handoff, it waits for this
+        # process to exit. Closing this dialog must still finish that handoff.
+        if not self._restart_pending:
+            self._restart_timer.stop()
+        with self._result_lock:
+            self._cancel.set()
+            while True:
+                try:
+                    kind, step, payload, _ = self._results.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "ok" and step == "download":
+                    self._discard_staged(payload, self._stage_dir)
+
+    def closeEvent(self, event):
+        self._on_finished()
+        super().closeEvent(event)
+
     def check(self):
+        if self._busy or self._closed or self._restart_pending:
+            return
         url = self.url.text().strip()
+        check = updater.check
         self.status.setText("Checking…")
         self._manifest = None
-        self._run(lambda: ("check", updater.check(url)))
+        self._run("check", lambda report: check(url))
 
     def install(self):
-        if not self._manifest:
+        if not self._manifest or self._busy or self._closed or self._restart_pending:
             return
+        manifest = copy.deepcopy(self._manifest)
+        download = updater.download
         self.status.setText("Downloading…")
-
-        def report(done, total):
-            if total:
-                self.status.setText(f"Downloading… {done * 100 // total}%")
-        self._run(lambda: ("download", updater.download(self._manifest, report)))
+        self._run("download", lambda report: download(manifest, report))
 
     def rollback(self):
+        if self._busy or self._closed or self._restart_pending:
+            return
         was = updater.previous_build_version()
         confirm = QMessageBox.question(
             self, "Go back to the previous build?",
@@ -2271,15 +2379,17 @@ class UpdateDialog(QDialog):
             + "\n\nThe current build is kept, so you can move forward again.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
-        if confirm != QMessageBox.StandardButton.Yes:
+        if confirm != QMessageBox.StandardButton.Yes or self._closed:
             return
         try:
             updater.downgrade()
         except Exception as exc:
-            self.status.setText(str(exc))
+            self.status.setText(self._error_text(exc))
             return
         self.status.setText("Restarting into the previous build…")
-        QTimer.singleShot(400, QApplication.quit)
+        self._restart_pending = True
+        self._set_enabled(False)
+        self._restart_timer.start(400)
 
 
 class WorkspaceDialog(QDialog):

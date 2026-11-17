@@ -1,0 +1,92 @@
+name: Publish verified Windows update
+run-name: Publish update from ${{ github.sha }}
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - dist/FBVenom.exe
+      - dist/FBVenom.build.json
+      - dist/FBVenom.sha256
+      - dist/manifest.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-fbvenom-update
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate the executable and prepare immutable manifest
+        id: prepare
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import tools_publish_update
+          from version import APP_VERSION
+
+          original = json.loads(Path('dist/manifest.json').read_text())
+          assert original['version'] == APP_VERSION, 'Manifest version differs from the app'
+          destination = Path(os.environ['RUNNER_TEMP']) / 'fbvenom-release'
+          destination.mkdir()
+          tools_publish_update.main([
+              'dist/FBVenom.exe', '--version', APP_VERSION,
+              '--notes', original.get('notes', ''),
+              '--out', str(destination / 'manifest.json'), '--force',
+          ])
+          prepared = json.loads((destination / 'manifest.json').read_text())
+          for key in ('version', 'url', 'sha256'):
+              assert original[key] == prepared[key], f'Published {key} is inconsistent'
+          assert Path('dist/FBVenom.sha256').read_text().strip() == prepared['sha256'] + '  FBVenom.exe', 'Checksum file differs from the verified executable'
+          (destination / 'notes.md').write_text(prepared.get('notes') or APP_VERSION)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={APP_VERSION}\n')
+              output.write(f'files={destination}\n')
+          PY
+      - name: Publish all verified assets together
+        shell: bash
+        env:
+          UPDATE_VERSION: ${{ steps.prepare.outputs.version }}
+          RELEASE_FILES: ${{ steps.prepare.outputs.files }}
+        run: |
+          set -euo pipefail
+          tag="v${UPDATE_VERSION}"
+          if gh release view "$tag" --json isDraft > "$RUNNER_TEMP/existing-release.json" 2>/dev/null; then
+            if [ "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["isDraft"])' "$RUNNER_TEMP/existing-release.json")" = False ]; then
+              mkdir "$RUNNER_TEMP/published-assets"
+              gh release download "$tag" --pattern manifest.json --pattern FBVenom.exe --dir "$RUNNER_TEMP/published-assets"
+              python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from tools_validate_windows_build import sha256_file
+          root = Path(os.environ['RUNNER_TEMP'])
+          expected = json.loads((Path(os.environ['RELEASE_FILES']) / 'manifest.json').read_text())
+          actual = json.loads((root / 'published-assets/manifest.json').read_text())
+          assert all(actual[k] == expected[k] for k in ('version', 'url', 'sha256'))
+          assert sha256_file(root / 'published-assets/FBVenom.exe') == expected['sha256']
+          print('Existing published release is already complete and verified')
+          PY
+              exit 0
+            fi
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --draft --title "FBVenom ${UPDATE_VERSION}" --notes-file "$RELEASE_FILES/notes.md"
+          fi
+          gh release upload "$tag" dist/FBVenom.exe dist/FBVenom.build.json dist/FBVenom.sha256 "$RELEASE_FILES/manifest.json" --clobber
+          gh release edit "$tag" --draft=false --latest
+          gh release view "$tag" --json url,assets

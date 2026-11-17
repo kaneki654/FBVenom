@@ -9,9 +9,16 @@ updater supports for LAN installs anyway.
 """
 
 import hashlib
+import io
+import email.message
+import datetime
 import json
 import os
 import subprocess
+import ssl
+import urllib.error
+import urllib.request
+import urllib.response
 import tempfile
 import unittest
 from unittest.mock import mock_open, patch
@@ -202,6 +209,223 @@ class DownloadTests(_Sandbox):
         self.assertIn("checksum", str(caught.exception).lower())
         # nothing half-downloaded is left lying around
         self.assertEqual(set(os.listdir(self.root)), before)
+
+
+class HTTPTransportTests(_Sandbox):
+    class Response(io.BytesIO):
+        def __init__(self, body=b"", url="https://updates.example/manifest.json", headers=None):
+            super().__init__(body)
+            self.url = url
+            self.headers = headers or {}
+
+    def manifest_bytes(self):
+        return json.dumps({"version": "9.9.9", "url": "https://updates.example/FBVenom.exe",
+                           "sha256": "a" * 64, "notes": "verified release"}).encode()
+
+    @staticmethod
+    def http_error(url, code, headers=None):
+        return urllib.error.HTTPError(url, code, "server failure", headers or {}, io.BytesIO(b"private error body"))
+
+    def test_transient_http_500_retries_same_address_and_closes_every_response(self):
+        url = "https://updates.example/manifest.json"
+        error = self.http_error(url, 500)
+        response = self.Response(self.manifest_bytes(), url)
+        with patch.object(updater._HTTPS_OPENER, "open", side_effect=[error, response]) as opened, \
+                patch.object(updater.time, "sleep") as sleep:
+            manifest = updater.fetch_manifest(url)
+        self.assertEqual(manifest["version"], "9.9.9")
+        self.assertEqual([call.args[0].full_url for call in opened.call_args_list], [url, url])
+        self.assertTrue(all(call.kwargs["timeout"] == 20 for call in opened.call_args_list))
+        sleep.assert_called_once_with(0.25)
+        self.assertTrue(error.fp.closed)
+        self.assertTrue(response.closed)
+
+    def test_exhausted_server_errors_report_status_and_safe_address_without_channel_fallback(self):
+        url = "https://user:secret@updates.example/channel/manifest.json?token=secret#secret"
+        errors = [self.http_error(url, 503) for _ in range(3)]
+        with patch.object(updater._HTTPS_OPENER, "open", side_effect=errors) as opened, \
+                patch.object(updater.time, "sleep") as sleep:
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.fetch_manifest(url)
+        message = str(caught.exception)
+        self.assertIn("HTTP 503", message)
+        self.assertIn("https://updates.example/channel/manifest.json", message)
+        self.assertIn("3 attempts", message)
+        self.assertNotIn("secret", message)
+        self.assertNotIn("user:", message)
+        self.assertNotIn("private error body", message)
+        self.assertEqual([call.args[0].full_url for call in opened.call_args_list], [url] * 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue(all(error.fp.closed for error in errors))
+
+    def test_default_channel_stays_on_official_release_address_after_failure(self):
+        url = updater.DEFAULT_MANIFEST_URL
+        with patch.object(updater._HTTPS_OPENER, "open", side_effect=[self.http_error(url, 500) for _ in range(3)]) as opened, \
+                patch.object(updater.time, "sleep"):
+            with self.assertRaises(updater.UpdateError):
+                updater.fetch_manifest(url)
+        self.assertEqual([call.args[0].full_url for call in opened.call_args_list], [url] * 3)
+
+    def test_missing_manifest_404_has_publication_diagnostic_without_retry(self):
+        url = updater.DEFAULT_MANIFEST_URL
+        error = self.http_error(url, 404)
+        with patch.object(updater._HTTPS_OPENER, "open", side_effect=error) as opened, \
+                patch.object(updater.time, "sleep") as sleep:
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.fetch_manifest(url)
+        self.assertIn("HTTP 404", str(caught.exception))
+        self.assertIn("not published", str(caught.exception))
+        opened.assert_called_once()
+        sleep.assert_not_called()
+        self.assertTrue(error.fp.closed)
+
+    def test_retry_after_is_honored_but_capped_at_two_seconds(self):
+        url = "https://updates.example/manifest.json"
+        for code, header, expected in ((429, "90", 2.0), (500, "1.5", 1.5), (502, "invalid", 0.25),
+                                       (503, "-1", 0.0), (504, "NaN", 0.25)):
+            with self.subTest(code=code, header=header):
+                response = self.Response(self.manifest_bytes(), url)
+                with patch.object(updater._HTTPS_OPENER, "open", side_effect=[
+                        self.http_error(url, code, {"Retry-After": header}), response]), \
+                        patch.object(updater.time, "sleep") as sleep:
+                    updater.fetch_manifest(url)
+                sleep.assert_called_once_with(expected)
+        future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)
+        self.assertEqual(updater._retry_delay({"Retry-After": email.utils.format_datetime(future)}, 1), 2.0)
+
+    def test_tls_verification_failure_is_not_retried_or_bypassed(self):
+        url = "https://updates.example/manifest.json?token=secret"
+        error = urllib.error.URLError(ssl.SSLCertVerificationError("private certificate detail"))
+        with patch.object(updater._HTTPS_OPENER, "open", side_effect=error) as opened, \
+                patch.object(updater.time, "sleep") as sleep:
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.fetch_manifest(url)
+        self.assertIn("TLS certificate verification failed", str(caught.exception))
+        self.assertNotIn("private", str(caught.exception))
+        self.assertNotIn("secret", str(caught.exception))
+        opened.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_timeout_and_dns_failures_are_actionable_without_private_exception_text(self):
+        url = "https://updates.example/manifest.json?token=secret"
+        for error in (TimeoutError("private timeout"), urllib.error.URLError("private DNS details")):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(updater._HTTPS_OPENER, "open", side_effect=error):
+                with self.assertRaises(updater.UpdateError) as caught:
+                    updater.fetch_manifest(url)
+                self.assertIn("updates.example/manifest.json", str(caught.exception))
+                self.assertNotIn("private", str(caught.exception))
+                self.assertNotIn("secret", str(caught.exception))
+
+    def test_final_url_validation_failure_closes_response(self):
+        response = self.Response(self.manifest_bytes(), "http://unsafe.example/manifest.json")
+        with patch.object(updater._HTTPS_OPENER, "open", return_value=response):
+            with self.assertRaises(updater.UpdateError):
+                updater.fetch_manifest("https://updates.example/manifest.json")
+        self.assertTrue(response.closed)
+
+    def test_non_json_and_oversized_manifests_are_closed_and_rejected(self):
+        url = "https://updates.example/manifest.json?token=secret"
+        for raw in (b"<html>private server error</html>", b"x" * (updater.MAX_MANIFEST + 1)):
+            response = self.Response(raw, url)
+            with self.subTest(length=len(raw)), patch.object(updater._HTTPS_OPENER, "open", return_value=response):
+                with self.assertRaises(updater.UpdateError) as caught:
+                    updater.fetch_manifest(url)
+            self.assertTrue(response.closed)
+            self.assertNotIn("private", str(caught.exception))
+            self.assertNotIn("secret", str(caught.exception))
+
+    def redirect_opener(self, downgrade):
+        visits, responses = [], []
+        manifest = self.manifest_bytes()
+        class Transport(urllib.request.BaseHandler):
+            handler_order = 100
+            def serve(self, request):
+                visits.append(request.full_url)
+                headers = email.message.Message()
+                if request.full_url.endswith("/start"):
+                    target = "http://cdn.example/intermediate" if downgrade else "https://cdn.example/final"
+                    headers["Location"] = target
+                    response = urllib.response.addinfourl(io.BytesIO(b""), headers, request.full_url, 302)
+                    response.msg = "Found"
+                elif request.full_url.endswith("/intermediate"):
+                    headers["Location"] = "https://cdn.example/final"
+                    response = urllib.response.addinfourl(io.BytesIO(b""), headers, request.full_url, 302)
+                    response.msg = "Found"
+                else:
+                    response = urllib.response.addinfourl(io.BytesIO(manifest), headers, request.full_url, 200)
+                    response.msg = "OK"
+                responses.append(response)
+                return response
+            https_open = serve
+            http_open = serve
+        return urllib.request.build_opener(updater._HTTPSOnlyRedirect(), Transport()), visits, responses
+
+    def test_https_to_http_to_https_redirect_is_refused_before_insecure_hop(self):
+        opener, visits, responses = self.redirect_opener(downgrade=True)
+        with patch.object(updater, "_HTTPS_OPENER", opener):
+            with self.assertRaises(updater.UpdateError):
+                updater.fetch_manifest("https://updates.example/start")
+        self.assertEqual(visits, ["https://updates.example/start"])
+        self.assertTrue(all(response.closed for response in responses))
+
+    def test_all_https_cdn_redirect_remains_supported(self):
+        opener, visits, responses = self.redirect_opener(downgrade=False)
+        with patch.object(updater, "_HTTPS_OPENER", opener):
+            manifest = updater.fetch_manifest("https://updates.example/start")
+        self.assertEqual(manifest["version"], "9.9.9")
+        self.assertEqual(visits, ["https://updates.example/start", "https://cdn.example/final"])
+        self.assertTrue(all(response.closed for response in responses))
+
+    def test_download_retries_before_body_and_keeps_exact_verified_size(self):
+        content = b"verified build bytes"
+        url = "https://updates.example/FBVenom.exe"
+        response = self.Response(content, "https://cdn.example/FBVenom.exe", {"Content-Length": str(len(content))})
+        manifest = {"url": url, "sha256": hashlib.sha256(content).hexdigest()}
+        progress = []
+        with patch.object(updater._HTTPS_OPENER, "open", side_effect=[self.http_error(url, 500), response]) as opened, \
+                patch.object(updater.time, "sleep"):
+            staged = updater.download(manifest, lambda done, total: progress.append((done, total)))
+        self.addCleanup(lambda: os.path.exists(staged) and os.unlink(staged))
+        with open(staged, "rb") as source:
+            self.assertEqual(source.read(), content)
+        self.assertEqual(progress, [(len(content), len(content))])
+        self.assertTrue(response.closed)
+        self.assertTrue(all(call.kwargs["timeout"] == 60 for call in opened.call_args_list))
+
+    def test_failed_download_http_and_redirect_validation_remove_staged_file(self):
+        url = "https://updates.example/FBVenom.exe"
+        manifest = {"url": url, "sha256": "a" * 64}
+        for failure in (self.http_error(url, 404), self.Response(b"bad", "http://unsafe.example/build.exe")):
+            before = set(os.listdir(self.root))
+            with self.subTest(failure=type(failure).__name__), \
+                    patch.object(updater._HTTPS_OPENER, "open", side_effect=failure if isinstance(failure, Exception) else None,
+                                 return_value=failure):
+                with self.assertRaises(updater.UpdateError):
+                    updater.download(manifest)
+            self.assertEqual(set(os.listdir(self.root)), before)
+            if not isinstance(failure, Exception):
+                self.assertTrue(failure.closed)
+
+    def test_download_cancellation_from_progress_closes_stream_and_removes_staging(self):
+        content = b"verified build bytes"
+        response = self.Response(content, "https://updates.example/FBVenom.exe")
+        manifest = {"url": response.url, "sha256": hashlib.sha256(content).hexdigest()}
+        def cancel(*args):
+            raise updater.UpdateError("Update cancelled")
+        before = set(os.listdir(self.root))
+        with patch.object(updater._HTTPS_OPENER, "open", return_value=response):
+            with self.assertRaisesRegex(updater.UpdateError, "Update cancelled"):
+                updater.download(manifest, cancel)
+        self.assertTrue(response.closed)
+        self.assertEqual(set(os.listdir(self.root)), before)
+
+    def test_read_only_application_folder_is_reported_without_raw_exception(self):
+        with patch.object(updater.tempfile, "mkstemp", side_effect=OSError("private filesystem details")):
+            with self.assertRaises(updater.UpdateError) as caught:
+                updater.download({"url": "https://updates.example/FBVenom.exe", "sha256": "a" * 64})
+        self.assertIn("application folder", str(caught.exception))
+        self.assertNotIn("private", str(caught.exception))
 
 
 class SwapTests(_Sandbox):
