@@ -77,9 +77,16 @@ Download Google's Windows Android platform-tools and extract the
 `FBVENOM_PLATFORM_TOOLS` to its directory. Linux ADB cannot be bundled into a
 Windows executable.
 
+The build also bundles the **USB internet** helpers: the official Gnirehtet
+2.5.1 relay (`gnirehtet.exe`), its Android client APK, license and provenance.
+`tools_prepare_usb_internet.py` downloads the pinned release and refuses it
+unless its SHA-256 matches; set `FBVENOM_GNIREHTET_DIR` to use another verified
+copy.
+
 ```powershell
 python -m pip install -r requirements-build.txt
 python -m unittest discover -v
+python tools_prepare_usb_internet.py --platform windows --out gnirehtet
 python -m PyInstaller --clean --noconfirm FBVenom.spec
 python tools_validate_windows_build.py dist/FBVenom.exe --source-commit (git rev-parse HEAD)
 ```
@@ -176,6 +183,81 @@ Focused checks (no devices, posts, or external provider requests):
 
 ```bash
 python -m unittest test_server_modes test_core_server_modes test_gui_server_modes -v
+```
+
+## AI connection speed and outages
+
+Comments are composed **while the phone opens the post**, not after it, so the
+AI round trip is hidden behind the phone's own loading time. AI requests reuse
+their HTTPS connection instead of opening a new one each time (measured
+against the Cloudflare-fronted endpoint: about 0.1 s instead of 0.3–0.6 s per
+request).
+
+When the AI server stops answering, the whole fleet reacts once instead of
+every phone waiting out its own timeouts. Two failures in a row (timeout,
+refused connection or an HTTP 5xx such as Cloudflare's 524) mark the server as
+down; phones immediately use offline rewordings of your examples, and one
+background check retries the server (after 10, 20, 40, then every 60 seconds).
+The first successful answer switches AI comments back on. A refused connection
+during the session-start check marks it down straight away; a start-up timeout
+does not, because a cold model may still be loading.
+
+Diagnostics explain what happened, once per outage rather than once per phone:
+
+| code | meaning |
+|---|---|
+| `AI_TIMEOUT` | the server did not answer in time (overloaded, or running without its GPU) |
+| `AI_UNREACHABLE` | address, DNS or connection failure |
+| `AI_SERVER_ERROR` | the server or its proxy returned 5xx (busy, restarting, 524 timeout) |
+| `AI_SLOW` | replies arrive but take 25 s or more |
+| `AI_RECOVERED` | the server answers again; AI comments resumed |
+| `AI_AUTH_FAILED` | the key was rejected; the AI stays off for the session |
+| `AI_REQUEST_REJECTED` | the model name or address is wrong |
+
+## USB internet
+
+Click **USB internet** in the header to share this computer's internet with
+every phone connected by a USB data cable, so phones no longer depend on their
+own Wi-Fi or mobile data. This is reverse tethering over USB debugging: each
+phone runs the Gnirehtet VPN client, its traffic rides the cable, and the PC
+sends it out through its normal connection (Wi-Fi or Ethernet). It needs
+Android 5.0 or newer, USB debugging authorized for this computer, and no other
+VPN active on the phone.
+
+1. Connect the phones and open **USB internet**; it scans automatically.
+2. Click **Start USB internet**. Phones are started eight at a time; the client
+   is installed on first use.
+3. Each phone shows **Online via PC** when its VPN is up.
+
+**Approve each phone's VPN prompt automatically** (on by default) pre-approves
+Android's VPN request over USB debugging, so no one has to tap OK on every
+phone. Turn it off to approve the prompt on each phone yourself; Android
+remembers the approval.
+
+The window shows which connection the PC is sharing. Ethernet works and is
+reported as a warning only because Wi-Fi was requested: to share Wi-Fi, make it
+the PC's preferred connection or unplug Ethernet, then start again. FBVenom
+never changes adapters or routes.
+
+Phones stay online after the window closes. **Stop all**, or closing FBVenom,
+stops every VPN it started and removes its USB tunnels, so no phone is left on a
+dead connection. Tunnels and VPNs left behind by a crashed session are cleaned
+up on the next start; another tool's tunnel or VPN is never touched. The relay
+listens only on `127.0.0.1`.
+
+Every event is shown in the window's log, copied to Diagnostics when it is a
+warning or error, and saved as JSON lines in `logs/venom_usb_internet.log`
+beside the app (rotated at 1 MB, falling back to `~/.fbvenom/logs` if the app
+folder is read-only). **Copy log** and **Open log folder** are in the window.
+Common codes: `TETHER_NO_USB_DEVICES`, `TETHER_DEVICE_UNAUTHORIZED`,
+`TETHER_PC_*` (computer internet problems), `TETHER_INSTALL_FAILED`,
+`TETHER_VPN_CONFLICT`, `TETHER_VPN_APPROVAL_REQUIRED`, `TETHER_RELAY_FAILED`
+and `TETHER_DEVICE_DISCONNECTED`; each comes with a suggested next step.
+
+Focused checks (no phones, ADB or network changes):
+
+```bash
+QT_QPA_PLATFORM=offscreen python -m unittest test_usb_internet test_gui_usb_internet test_ai_delivery -v
 ```
 
 ## Sarcastic anger

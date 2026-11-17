@@ -31,3 +31,7 @@ venv/
 *.bak
 *.bak.*
 *~
+
+# USB internet helpers are fetched and verified at build time
+/gnirehtet/
+/logs/

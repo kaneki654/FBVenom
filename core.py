@@ -13,9 +13,14 @@ import random
 import json
 import threading
 import concurrent.futures
+import http.client
+import io
+import socket
+import ssl
 import urllib.request
 import urllib.error
 import urllib.parse
+import urllib.response
 from typing import Any
 import xml.etree.ElementTree as ET
 import uiautomator2 as u2
@@ -1275,7 +1280,137 @@ SUSPENDED_MARKERS = (
     "appeal",
 )
 
-NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_AI_SSL_CONTEXT = [None]
+_AI_SSL_LOCK = threading.Lock()
+
+
+def _ai_ssl_context():
+    with _AI_SSL_LOCK:
+        if _AI_SSL_CONTEXT[0] is None:
+            _AI_SSL_CONTEXT[0] = ssl.create_default_context()
+        return _AI_SSL_CONTEXT[0]
+
+
+class _KeepAliveAIHandler(urllib.request.BaseHandler):
+    """Reuse TCP/TLS connections for AI chat requests, and only for those.
+
+    urllib opens a brand-new connection for every request. Against the
+    Cloudflare-fronted endpoint that is DNS + TCP + TLS before the prompt is
+    even sent - measured at ~0.8s of a ~1.1s round trip - and one comment often
+    needs two or three calls once the quality gates reject a wording. Requests
+    opt in by carrying ``_ai_keepalive``; every other request on these openers
+    (link resolution, Pollinations, update checks) falls through to the stock
+    handlers untouched. The body is read in full before the connection goes
+    back to the pool, so a caller can never leave a half-read response on a
+    socket another phone is about to reuse.
+    """
+
+    handler_order = 450          # ahead of the stock HTTP(S)Handler (500)
+    MAX_IDLE = 8
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._idle = {}
+        self._epoch = 0
+
+    def reset(self):
+        """Drop idle sockets, e.g. after the endpoint or its key changed."""
+        with self._lock:
+            idle, self._idle = self._idle, {}
+            self._epoch += 1
+        for pool in idle.values():
+            for conn in pool:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def idle_count(self):
+        with self._lock:
+            return sum(len(pool) for pool in self._idle.values())
+
+    def _checkout(self, key, timeout):
+        with self._lock:
+            pool = self._idle.get(key)
+            if pool:
+                return pool.pop(), True, self._epoch
+            epoch = self._epoch
+        scheme, host, port = key
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=timeout,
+                                               context=_ai_ssl_context())
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        return conn, False, epoch
+
+    def _checkin(self, key, conn, epoch):
+        with self._lock:
+            if epoch == self._epoch:
+                pool = self._idle.setdefault(key, [])
+                if len(pool) < self.MAX_IDLE:
+                    pool.append(conn)
+                    return
+        conn.close()
+
+    def _open(self, req, scheme):
+        if not getattr(req, "_ai_keepalive", False):
+            return None          # not ours: let the stock handler take it
+        parts = urllib.parse.urlsplit(req.full_url)
+        if not parts.hostname:
+            raise urllib.error.URLError("no host given")
+        key = (scheme, parts.hostname, parts.port or (443 if scheme == "https" else 80))
+        timeout = req.timeout
+        if timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+            timeout = None
+        headers = dict(req.header_items())
+        for attempt in (0, 1):
+            conn, reused, epoch = self._checkout(key, timeout)
+            try:
+                if reused and conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                try:
+                    conn.request(req.get_method(), req.selector, body=req.data,
+                                 headers=headers)
+                except (BrokenPipeError, ConnectionResetError,
+                        ConnectionAbortedError, http.client.CannotSendRequest):
+                    raise
+                except OSError as exc:
+                    # Same shape as urllib's own handler for a failed send.
+                    raise urllib.error.URLError(exc) from None
+                response = conn.getresponse()
+                data = response.read()
+            except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+                    BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                conn.close()
+                # The server closed an idle keep-alive socket between requests.
+                # Nothing was processed, so one fresh connection is safe; a
+                # timeout is NOT retried - the server may still be generating.
+                if reused and attempt == 0:
+                    continue
+                raise
+            except BaseException:
+                conn.close()
+                raise
+            if response.will_close:
+                conn.close()
+            else:
+                self._checkin(key, conn, epoch)
+            result = urllib.response.addinfourl(io.BytesIO(data), response.headers,
+                                                req.full_url, response.status)
+            result.msg = response.reason
+            return result
+        raise urllib.error.URLError("AI connection closed")   # pragma: no cover
+
+    def http_open(self, req):
+        return self._open(req, "http")
+
+    def https_open(self, req):
+        return self._open(req, "https")
+
+
+_AI_KEEPALIVE = _KeepAliveAIHandler()
+_AI_LAN_KEEPALIVE = _KeepAliveAIHandler()
+NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}), _AI_KEEPALIVE)
 
 
 class _NoLANRedirect(urllib.request.HTTPRedirectHandler):
@@ -1286,7 +1421,7 @@ class _NoLANRedirect(urllib.request.HTTPRedirectHandler):
 
 
 LAN_NOPROXY = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}), _NoLANRedirect())
+    urllib.request.ProxyHandler({}), _NoLANRedirect(), _AI_LAN_KEEPALIVE)
 
 # Rate limit comes from the provider preset: a hosted endpoint needs spacing,
 # a local Ollama does not. Read live so changing provider takes effect at once.
@@ -1632,13 +1767,19 @@ def _fatal_ai_error(code, detail):
 
 
 def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None,
-               cfg=None):
+               cfg=None, _probe=False):
     # Try the good model first; fall back to the small one only if the big one
     # is unavailable (rate limit / decommissioned), so a bad key or a busy
     # endpoint degrades instead of failing outright.
     # `prompt_text` may be a plain string or an OpenAI content-block list, which
     # is how an image rides along on the vision call - both go straight into the
     # user message.
+    # `_probe` marks the health checks (session start, warm-up, the breaker's
+    # own re-check): they always reach the endpoint, everything else is turned
+    # away without a request while the shared breaker is open.
+    if not _probe and _ai_breaker["open"]:
+        raise AIEndpointCooling("AI endpoint is resting after failures: "
+                                + (_ai_breaker["reason"] or "not answering"))
     cfg = ai_cfg() if cfg is None else cfg
     # venom_ai.json's "timeout" was ignored on the two call sites that matter -
     # generate_comment and _generate_context_comment pass no timeout, so every
@@ -1692,11 +1833,15 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
             body.update(sampling)
             req = urllib.request.Request(
                 url, data=json.dumps(body).encode("utf-8"), headers=headers)
+            req._ai_keepalive = True
+            started = time.time()
             try:
                 opener = LAN_NOPROXY if aiconfig.get_server_mode(cfg) == "lan" else NOPROXY
                 with opener.open(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                return data["choices"][0]["message"]["content"]
+                content = data["choices"][0]["message"]["content"]
+                _ai_breaker_success(None if _probe == "warmup" else time.time() - started)
+                return content
             except urllib.error.HTTPError as e:
                 try:
                     detail = e.read().decode("utf-8", "replace")
@@ -1706,6 +1851,15 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
                     e.close()
                 last = RuntimeError(f"HTTP {e.code} on {mdl}: {detail[:200]}"
                                     if detail else f"HTTP {e.code} on {mdl}")
+                if e.code >= 500:
+                    # Overloaded, crashed or unreachable behind a proxy (502/
+                    # 503/504/524): the endpoint itself is the problem, and
+                    # the fallback model lives on the same server.
+                    # At session start a 5xx is a definite answer: open now
+                    # rather than letting every phone find out on its own.
+                    _ai_breaker_failure(last, http_code=e.code, force=_probe == "start")
+                    if _ai_breaker["open"] and not _probe:
+                        raise last
                 # No key, no credit, no quota: the fallback model shares the
                 # same key, so trying it just repeats the same 400.
                 if _fatal_ai_error(e.code, detail):
@@ -1719,8 +1873,14 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
                         print("  [ai] !! this is a KEY/BILLING problem, not a "
                               "network one. Fix it in AI Settings - the AI is "
                               "off for this run.")
+                        report_error("AI_AUTH_FAILED", detail=f"HTTP {e.code} on {mdl}: {said}",
+                                     severity="error")
                     _ai_off[0] = True
                     raise last
+                if 400 <= e.code < 500 and e.code != 429 and not (
+                        e.code == 400 and _sampling_rejected(detail)):
+                    _ai_say_once(f"rejected-{e.code}", "AI_REQUEST_REJECTED",
+                                 f"HTTP {e.code} on {mdl}: {detail[:200]}")
                 # The MODEL is fine, the sampling params are not. Retry it as-is
                 # rather than dropping to the fallback model.
                 if (e.code == 400 and sampling and attempt == 0
@@ -1743,6 +1903,13 @@ def _groq_chat(prompt_text, timeout=None, system=None, max_tokens=60, model=None
                 break
             except Exception as e:
                 last = e
+                if _ai_transport_error(e):
+                    # A refused/unresolvable endpoint at session start is
+                    # down; a start-up TIMEOUT may just be a cold model
+                    # loading, so that one only counts like any other.
+                    _ai_breaker_failure(e, force=_probe == "start" and not _is_timeout(e))
+                    if _ai_breaker["open"] and not _probe:
+                        raise
                 break
     raise last if last else RuntimeError("AI: no model available")
 
@@ -3203,6 +3370,10 @@ def _generate_context_comment(examples, ctx, retries=3, avoid_openings=None,
     )
     max_tok = max(60, min(400, target * 6 + 60))
     for attempt in range(retries):
+        # Checked before taking a pacing slot: a phone must not queue behind
+        # the fleet only to learn the endpoint is resting.
+        if _ai_is_off():
+            return ""
         if not _ai_wait_slot():
             return ""
         try:
@@ -3255,6 +3426,10 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
                                         tone=tone, cfg=cfg)
         if out:
             return out
+        if _ai_is_off():
+            # The endpoint is resting (or off): no style retry and no reword
+            # pass - the caller's offline wordings take over immediately.
+            return example
         # A style that could not be satisfied must not cost us the POST. Drop
         # the style, keep the post: an on-topic comment in a plainer voice
         # beats a perfectly-styled reword of an example written under some
@@ -3339,14 +3514,15 @@ def generate_comment(example, retries=3, avoid_openings=None, tone=None,
     )
 
     for attempt in range(retries):
-        if not _ai_wait_slot():
-            return example          # PURGE: don't start a fresh AI call
         # A bad key or an empty balance answers every phone identically, so
         # once _groq_chat has said so there is nothing left to retry. Without
         # this the fleet still burned retries x providers x comments x 19
         # threads against an endpoint that had already given its final answer.
+        # Checked BEFORE the pacing slot, so a resting endpoint costs no wait.
         if _ai_is_off():
             return example
+        if not _ai_wait_slot():
+            return example          # PURGE: don't start a fresh AI call
         if lan_only or str(cfg.get("api_key") or "").strip():
             try:
                 raw = _groq_chat(prompt_text, system=system_prompt,
@@ -3420,7 +3596,7 @@ def start_llama():
         if lan_only:
             print("  [ai] Checking LAN AI gateway...")
             try:
-                _groq_chat("hi", timeout=15, cfg=cfg)
+                _groq_chat("hi", timeout=15, cfg=cfg, _probe="start")
                 print("  [ai] LAN AI gateway ready.")
                 return True
             except Exception as e:
@@ -3428,10 +3604,16 @@ def start_llama():
                 return False
         print("  [ai] Checking Groq AI (free tier)...")
         try:
-            _groq_chat("hi", timeout=15, cfg=cfg)
+            _groq_chat("hi", timeout=15, cfg=cfg, _probe="start")
             print("  [ai] Groq AI ready.")
             return True
         except Exception as e:
+            if ai_endpoint_open():
+                # Phones skip every AI path while the breaker is open, so a
+                # healthy Pollinations would only make this check lie.
+                print(f"  [ai] AI endpoint is down ({e}); comments use offline "
+                      f"wordings until it answers again.")
+                return False
             print(f"  [ai] Groq check failed ({e}); falling back to Pollinations...")
     import urllib.parse
     print("  [ai] Checking Pollinations AI (plain-text endpoint)...")
@@ -3669,6 +3851,161 @@ _ai_off = [False]            # hard off: a key/billing answer never self-heals
 _ai_cold_until = [0.0]
 AI_COOLDOWN = 120.0
 
+# ── Shared AI endpoint breaker ────────────────────────────────────────────
+# A stalled endpoint used to cost EVERY phone the full timeout on EVERY try:
+# three context attempts, two style retries and three rewording attempts, each
+# up to the 90s timeout - about ten minutes per comment per phone - and every
+# abandoned request stayed queued on the server, deepening its backlog (590
+# requests in flight on a gateway with 18 live clients, measured). One breaker
+# now decides for the whole fleet. Two transport failures in a row (timeout,
+# refused/reset connection, HTTP 5xx) open it; phones then use the offline
+# wordings at once instead of queueing, and ONE background probe decides when
+# the AI is back. Any success closes it. Cleared at every session start.
+AI_BREAKER_THRESHOLD = 2
+AI_PROBE_DELAYS = (10.0, 20.0, 40.0, 60.0)   # then every 60s while open
+AI_PROBE_TIMEOUT = 60.0
+AI_SLOW_SECONDS = 25.0
+_ai_breaker_lock = threading.Lock()
+_ai_breaker = {"failures": 0, "open": False, "since": 0.0, "reason": "",
+               "generation": 0, "probing": False, "said": set()}
+
+
+class AIEndpointCooling(RuntimeError):
+    """Raised without sending anything while the shared AI breaker is open."""
+
+
+def ai_endpoint_open():
+    """True while the fleet is skipping the AI endpoint after failures."""
+    return bool(_ai_breaker["open"])
+
+
+def _is_timeout(exc):
+    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
+        exc = exc.reason
+    return isinstance(exc, (TimeoutError, socket.timeout)) or "timed out" in str(exc).lower()
+
+
+def _ai_transport_error(exc):
+    """True when a failure says the endpoint itself is down or stalled."""
+    if isinstance(exc, AIEndpointCooling):
+        return False
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+    return isinstance(exc, (OSError, http.client.HTTPException))
+
+
+def _ai_say_once(key, code, detail="", severity="warning"):
+    """One diagnostic per outage and kind - never one per phone."""
+    with _ai_breaker_lock:
+        if key in _ai_breaker["said"]:
+            return
+        _ai_breaker["said"].add(key)
+    try:
+        report_error(code, detail=detail, severity=severity)
+    except Exception:
+        pass
+
+
+def _ai_breaker_success(elapsed=None):
+    with _ai_breaker_lock:
+        was_open = _ai_breaker["open"]
+        down_for = time.time() - _ai_breaker["since"] if was_open else 0.0
+        _ai_breaker["failures"] = 0
+        _ai_breaker["open"] = False
+        _ai_breaker["reason"] = ""
+        if was_open:
+            _ai_breaker["said"].discard("outage")   # a later outage is news
+    try:
+        if was_open:
+            took = f" in {elapsed:.1f}s" if elapsed is not None else ""
+            print(f"  [ai] endpoint answering again{took} after {down_for:.0f}s "
+                  f"- AI comments resume")
+            report_error("AI_RECOVERED", severity="info",
+                         detail=f"Answered{took} after {down_for:.0f}s of failures.")
+        if elapsed is not None and elapsed >= AI_SLOW_SECONDS:
+            _ai_say_once("slow", "AI_SLOW",
+                         f"A reply took {elapsed:.0f}s; a healthy server answers in a few seconds.")
+    except Exception:
+        pass
+
+
+def _ai_breaker_failure(exc, http_code=None, force=False):
+    """Count one endpoint failure; open the breaker once it is clearly down."""
+    if http_code is not None:
+        code = "AI_SERVER_ERROR"
+    elif _is_timeout(exc):
+        code = "AI_TIMEOUT"
+    else:
+        code = "AI_UNREACHABLE"
+    with _ai_breaker_lock:
+        _ai_breaker["failures"] += 1
+        opening = not _ai_breaker["open"] and (
+            force or _ai_breaker["failures"] >= AI_BREAKER_THRESHOLD)
+        if not opening:
+            return
+        _ai_breaker["open"] = True
+        _ai_breaker["since"] = time.time()
+        reason = f"HTTP {http_code}" if http_code is not None else type(exc).__name__
+        _ai_breaker["reason"] = _diagnostic_text(f"{reason}: {exc}", 180)
+        start_probe = not _ai_breaker["probing"]
+        if start_probe:
+            _ai_breaker["probing"] = True
+        generation = _ai_breaker["generation"]
+        say = "outage" not in _ai_breaker["said"]
+        _ai_breaker["said"].add("outage")
+        reason = _ai_breaker["reason"]
+    print(f"  [ai] endpoint failing ({reason}) - phones use offline wordings "
+          f"while it is re-checked in the background")
+    if say:
+        try:
+            report_error(code, detail=reason, severity="warning")
+        except Exception:
+            pass
+    if start_probe:
+        _start_ai_probe(generation)
+
+
+def _start_ai_probe(generation):
+    threading.Thread(target=_ai_probe_loop, args=(generation,),
+                     name="ai-endpoint-probe", daemon=True).start()
+
+
+def _ai_probe_loop(generation):
+    """Re-check a failing endpoint with one tiny request - never from a phone."""
+    def stale():
+        return (_ai_breaker["generation"] != generation or not _ai_breaker["open"]
+                or _ai_off[0])
+    try:
+        attempt = 0
+        while True:
+            delay = AI_PROBE_DELAYS[min(attempt, len(AI_PROBE_DELAYS) - 1)]
+            attempt += 1
+            deadline = time.time() + delay
+            while time.time() < deadline:
+                if stale():
+                    return
+                time.sleep(min(0.5, max(0.0, deadline - time.time())))
+            if stale():
+                return
+            try:
+                cfg = ai_cfg()
+                try:
+                    limit = float(cfg.get("timeout") or AI_PROBE_TIMEOUT)
+                except (TypeError, ValueError):
+                    limit = AI_PROBE_TIMEOUT
+                _groq_chat("hi", timeout=min(AI_PROBE_TIMEOUT, limit),
+                           system="Reply with one word.", max_tokens=4, cfg=cfg,
+                           _probe="recheck")
+                return               # the success already closed the breaker
+            except Exception as exc:
+                nxt = AI_PROBE_DELAYS[min(attempt, len(AI_PROBE_DELAYS) - 1)]
+                print(f"  [ai] endpoint still failing ({type(exc).__name__}) - "
+                      f"next check in {nxt:.0f}s")
+    finally:
+        with _ai_breaker_lock:
+            if _ai_breaker["generation"] == generation:
+                _ai_breaker["probing"] = False
+
 
 def _pool(url=None):
     """This link's used-wording sets. Call with _used_lock held."""
@@ -3684,8 +4021,9 @@ def _pool(url=None):
 
 
 def _ai_is_off():
-    """True while the AI must not be called: hard off, or cooling down."""
-    return _ai_off[0] or time.time() < _ai_cold_until[0]
+    """True while the AI must not be called: hard off, cooling down, or the
+    shared breaker is open because the endpoint stopped answering."""
+    return _ai_off[0] or time.time() < _ai_cold_until[0] or bool(_ai_breaker["open"])
 
 
 def reset_ai_connection_state():
@@ -3707,6 +4045,15 @@ def reset_ai_connection_state():
     _poll_last_call[0] = 0.0
     with _ai_slot_lock:
         _ai_next_slot[0] = 0.0
+    with _ai_breaker_lock:
+        _ai_breaker.update(failures=0, open=False, since=0.0, reason="",
+                           probing=False, said=set())
+        # A probe left over from the previous session sees the new generation
+        # and exits without touching this one.
+        _ai_breaker["generation"] = _ai_breaker.get("generation", 0) + 1
+    # A changed endpoint or key must never ride an old socket.
+    _AI_KEEPALIVE.reset()
+    _AI_LAN_KEEPALIVE.reset()
 
 
 def reset_comment_pool():
@@ -3728,7 +4075,10 @@ def warm_ai_endpoint():
     """One throwaway generation so the model is resident before the run needs it."""
     try:
         t0 = time.time()
-        _groq_chat("hi", timeout=180, system="Reply with one word.", max_tokens=4)
+        # A cold load legitimately takes a minute, so the warm-up is never
+        # judged as "slow" - only real comment replies are.
+        _groq_chat("hi", timeout=180, system="Reply with one word.", max_tokens=4,
+                   _probe="warmup")
         print(f"  [ai] endpoint warm in {time.time() - t0:.0f}s")
     except Exception as e:
         print(f"  [ai] warm-up failed ({type(e).__name__}: {e}) - "
@@ -3816,6 +4166,67 @@ def unique_comment(example="", tone=None, ctx=""):
     if text:
         _claim_words(text)
     return text
+
+
+def prefetch_comment(tgt):
+    """Start composing a link's comment while the phone is still opening it.
+
+    Opening a post takes the phone several seconds; the comment used to be
+    composed only AFTER that, so every AI round trip (and every quality-gate
+    retry) was added on top. Composing alongside the open hides it. One
+    pending comment per phone thread: retries of the same open reuse it, so a
+    flaky open does not burn extra wordings.
+    """
+    try:
+        if not tgt.get("do_comment"):
+            return None
+        url = str(tgt.get("url") or "")
+        example = str(tgt.get("comment") or "")
+    except AttributeError:
+        return None
+    if not url:
+        return None
+    pending = getattr(_tls, "prefetch", None)
+    if pending and pending[0] == url and pending[1] == example:
+        return pending[2]
+    future = concurrent.futures.Future()
+
+    def work():
+        if not future.set_running_or_notify_cancel():
+            return
+        set_current_post_url(url)        # the per-post wording pool
+        try:
+            ctx = comment_examples_as_context(example) if example.strip() else ""
+            future.set_result(unique_comment(example, ctx=ctx))
+        except BaseException as exc:
+            future.set_exception(exc)
+
+    _tls.prefetch = (url, example, future)
+    threading.Thread(target=work, name="comment-prefetch", daemon=True).start()
+    return future
+
+
+def take_prefetched_comment(url, example):
+    """The prefetched wording for this link, or None to compose it inline.
+
+    Returns "" when Abort is pressed while waiting; the caller checks
+    stop_requested() before treating an empty result as anything else.
+    """
+    pending = getattr(_tls, "prefetch", None)
+    if not pending or pending[0] != url or pending[1] != str(example or ""):
+        return None
+    _tls.prefetch = None
+    future = pending[2]
+    while True:
+        try:
+            return future.result(timeout=0.25)
+        except concurrent.futures.TimeoutError:
+            if stop_requested():
+                return ""
+        except Exception as exc:
+            print(f"  [ai] prefetched comment failed ({type(exc).__name__}: {exc}) "
+                  f"- composing it now")
+            return None
 
 
 def _unique_comment_inner(example="", tone=None, ctx=""):
@@ -4643,6 +5054,24 @@ _ERROR_HELP = {
                                 "Check storage and installation prompts, or install Facebook Lite manually."),
     "AI_UNAVAILABLE": ("The AI provider could not be reached.",
                        "Check the provider in AI settings; comments will use your example wordings as a fallback."),
+    "AI_TIMEOUT": ("The AI server did not answer in time.",
+                   "Phones now use your example wordings and the server is re-checked in the "
+                   "background. If this repeats, the server is overloaded or running without its GPU."),
+    "AI_UNREACHABLE": ("The AI server could not be reached.",
+                       "Check the AI address, this computer's internet connection and that the server "
+                       "is running. Phones use your example wordings until it answers again."),
+    "AI_SERVER_ERROR": ("The AI server returned a server error.",
+                        "The server is busy, restarting or misconfigured. Phones use your example "
+                        "wordings and AI comments resume automatically when it recovers."),
+    "AI_SLOW": ("The AI server is answering slowly.",
+                "Comments are delayed while it catches up. Check the server's load and that its "
+                "GPU is in use; a healthy server answers in a few seconds."),
+    "AI_RECOVERED": ("The AI server is answering again.",
+                     "AI-written comments have resumed."),
+    "AI_AUTH_FAILED": ("The AI server rejected the API key.",
+                       "Enter the correct key in AI settings. The AI is off for this session."),
+    "AI_REQUEST_REJECTED": ("The AI server rejected the comment request.",
+                            "Check the model name and address in AI settings."),
     "ADB_TIMEOUT": ("An Android device command timed out.",
                     "Check the phone and USB connection; reconnect if it remains unresponsive."),
     "ADB_UNAVAILABLE": ("Android platform tools could not start.",
@@ -8177,7 +8606,13 @@ def _process_target(serial, d, tgt, account_num, link_no, n_links,
         # straight to the offline pool.
         ctx = (comment_examples_as_context(comment_example)
                if comment_example.strip() else "")
-        text = unique_comment(comment_example, ctx=ctx)
+        # Usually composed already, while the phone was opening this post.
+        text = take_prefetched_comment(url, comment_example)
+        if stop_requested():
+            results.append("stopped")
+            return "abort"
+        if text is None:
+            text = unique_comment(comment_example, ctx=ctx)
         if not text:
             # Every wording is already under this post. Skipping is the correct
             # outcome - posting a duplicate is worse than posting nothing.
@@ -8455,6 +8890,9 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                     dbg(serial, "open-link", f"account {account_num} -> {gate_url}")
                     task_log(serial, "open-link",
                              f"account {account_num} -> {_short_target(gate_url)}")
+                    # Compose the comment while the post opens (no-op when
+                    # this link's comment is already pending).
+                    prefetch_comment(gate_tgt)
                     # Verified open: lands on the post itself, not the feed.
                     if open_target_post(serial, d, gate_url):
                         gate_link_no = gate_no
@@ -8583,6 +9021,9 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                 # target post" and burned 3 cold reopens x 5 retries before the
                 # link was abandoned. _process_target sets it again, harmlessly.
                 set_current_post_url(tgt["url"])
+                # Compose this link's comment while the phone opens it; the
+                # gate link already has one pending, so this reuses it.
+                prefetch_comment(tgt)
                 if link_no != gate_link_no:
                     # the gate left ONE link on screen (0 = none opened); every
                     # other link still has to be opened here

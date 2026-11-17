@@ -14,6 +14,7 @@ import subprocess
 from urllib.parse import urlsplit
 import aiconfig
 import updater
+import usb_internet
 from workspaces import WorkspaceStore
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox,
@@ -21,10 +22,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
     QSizePolicy, QButtonGroup, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
     QCheckBox, QDialog, QTabBar, QSpinBox, QMessageBox, QPlainTextEdit)
 from PyQt6.QtCore import (Qt, QTimer, QPropertyAnimation, QEasingCurve,
-    QRect, QRectF, QPointF, QSize, QVariantAnimation, QPoint)
+    QRect, QRectF, QPointF, QSize, QVariantAnimation, QPoint, QUrl)
 from PyQt6.QtGui import (QPainter, QColor, QBrush, QPen, QFont, QFontDatabase,
     QPainterPath, QPolygonF, QPixmap, QIcon, QLinearGradient, QRadialGradient,
-    QCursor)
+    QCursor, QDesktopServices)
 
 # Import core functions from fb_core
 import core as fbcore
@@ -2110,6 +2111,266 @@ class BackUpServ(QDialog):
         self._closed = True
         self._poll.stop()
 
+
+class USBInternetDialog(QDialog):
+    """Share this PC's internet with every phone on a USB cable.
+
+    Reverse tethering over USB debugging: each phone runs the Gnirehtet VPN
+    client and its traffic rides the cable to the PC, which sends it out over
+    its own Wi-Fi or Ethernet. The manager belongs to the main window, so the
+    phones stay online after this dialog closes; worker threads only touch a
+    queue, never a widget.
+    """
+
+    STATES = {
+        "ready": ("Ready", C_MUTE),
+        "starting": ("Starting…", C_HAZARD),
+        "installing": ("Installing client…", C_HAZARD),
+        "approval_required": ("Tap OK on the phone's VPN prompt", C_HAZARD),
+        "vpn_active": ("Online via PC", C_TOXIC2),
+        "stopped": ("Stopped", C_FAINT),
+        "failed": ("Failed", C_BLOOD),
+        "stop_failed": ("Stop failed", C_BLOOD),
+        "unauthorized": ("USB debugging not authorized", C_BLOOD),
+        "offline": ("Offline", C_BLOOD),
+        "disconnected": ("Disconnected", C_BLOOD),
+        "unmanaged": ("Used by another tool", C_HAZARD),
+    }
+    ACTIONS = {"scan": "Looking for USB phones…",
+               "start": "Starting USB internet on every USB phone…",
+               "stop": "Stopping USB internet and restoring the phones…"}
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+        self._busy = False
+        self._closed = False
+        self._ticks = 0
+        self._results = queue.Queue()
+        self.setWindowTitle("USB INTERNET")
+        self.setMinimumWidth(700)
+        self.setStyleSheet(
+            f"QDialog{{background:{C_BG}}}"
+            f"QLabel{{color:{C_MUTE};font-family:'{F_UI}';font-size:12px;background:transparent}}"
+            f"QListWidget{{background:{C_INPUT};color:{C_TEXT};border:1px solid {C_BORDER};"
+            f"border-radius:8px;padding:4px;font-family:'{F_MONO}';font-size:11px}}"
+            f"QPlainTextEdit{{background:{C_INPUT};color:{C_TEXT};border:1px solid {C_BORDER};"
+            f"border-radius:8px;padding:6px;font-family:'{F_MONO}';font-size:11px}}")
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(24, 22, 24, 20)
+        lo.setSpacing(12)
+        title = QLabel("USB INTERNET")
+        title.setStyleSheet(f"color:{C_TEXT};font-size:20px;font-weight:600;"
+                            f"font-family:'{F_DISP}';background:transparent")
+        lo.addWidget(title)
+        intro = QLabel("Phones on a USB cable with USB debugging use this computer's "
+                       "internet through a VPN tunnel over the cable, so they no longer "
+                       "depend on their own Wi‑Fi or mobile data.")
+        intro.setWordWrap(True)
+        lo.addWidget(intro)
+        self.network = QLabel("Computer internet: not checked yet")
+        self.network.setWordWrap(True)
+        self.network.setStyleSheet(f"color:{C_TEXT};font-weight:600")
+        lo.addWidget(self.network)
+        self.devices = QListWidget()
+        self.devices.setAccessibleName("USB phones")
+        self.devices.setMinimumHeight(150)
+        lo.addWidget(self.devices)
+        self.auto_vpn = NeonCheck("Approve each phone's VPN prompt automatically over USB debugging")
+        self.auto_vpn.setChecked(getattr(window, "_usb_auto_vpn", True))
+        self.auto_vpn.setToolTip("Off: tap OK on Android's VPN connection request on every phone once.")
+        self.auto_vpn.toggled.connect(lambda on: setattr(window, "_usb_auto_vpn", bool(on)))
+        lo.addWidget(self.auto_vpn)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setMinimumHeight(36)
+        lo.addWidget(self.status)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.scan_btn = GhostButton("Scan phones")
+        self.scan_btn.clicked.connect(lambda: self._run("scan"))
+        row.addWidget(self.scan_btn)
+        self.stop_btn = GhostButton("Stop all")
+        self.stop_btn.clicked.connect(lambda: self._run("stop"))
+        row.addWidget(self.stop_btn)
+        row.addStretch()
+        self.start_btn = HazardButton("Start USB internet", C_TOXIC, primary=True, depth=0)
+        self.start_btn.setMinimumSize(self.start_btn.fontMetrics().horizontalAdvance(
+            self.start_btn.text()) + 34, 40)
+        self.start_btn.clicked.connect(lambda: self._run("start"))
+        row.addWidget(self.start_btn)
+        lo.addLayout(row)
+        log_head = QHBoxLayout()
+        log_head.addWidget(QLabel("Activity and error log"))
+        log_head.addStretch()
+        self.copy_btn = GhostButton("Copy log")
+        self.copy_btn.clicked.connect(self._copy_log)
+        log_head.addWidget(self.copy_btn)
+        self.folder_btn = GhostButton("Open log folder")
+        self.folder_btn.clicked.connect(self._open_log_folder)
+        log_head.addWidget(self.folder_btn)
+        lo.addLayout(log_head)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(4000)
+        self.log.setMinimumHeight(170)
+        self.log.setPlaceholderText("Events appear here with a code, the phone, and a suggested next step. "
+                                    "They are also saved to the log folder.")
+        lo.addWidget(self.log)
+        close = GhostButton("Close")
+        close.clicked.connect(self.reject)
+        lo.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        for event in list(getattr(window, "_usb_history", [])):
+            self.append_event(event)
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._drain)
+        self._poll.start(150)
+        self.finished.connect(self._on_finished)
+        manager = window.usb_manager()
+        if manager is None:
+            self.status.setText("USB internet is unavailable: " + window.usb_helper_error()
+                                + " Reinstall this FBVenom build.")
+        else:
+            if getattr(window, "running", False):
+                self.status.setText("A session is running. Starting USB internet briefly "
+                                    "interrupts each phone's connection.")
+            self._run("scan")
+        self._refresh()
+
+    @staticmethod
+    def event_text(event):
+        severity = str(event.get("severity") or "info").upper()
+        head = f"[{event.get('time') or time.strftime('%H:%M:%S')}] {severity} {event.get('code') or ''}"
+        if event.get("serial"):
+            head += f" · {event['serial']}"
+        lines = [head, str(event.get("message") or "")]
+        if event.get("detail"):
+            lines.append("Detail: " + str(event["detail"]))
+        if event.get("hint") and severity != "INFO":
+            lines.append("Next step: " + str(event["hint"]))
+        return "\n".join(lines)
+
+    def append_event(self, event):
+        if not self._closed:
+            self.log.appendPlainText(self.event_text(event) + "\n")
+
+    def _copy_log(self):
+        QApplication.clipboard().setText(self.log.toPlainText())
+        self.status.setText("Log copied to the clipboard.")
+
+    def _open_log_folder(self):
+        manager = self._window.usb_manager()
+        path = getattr(manager, "log_path", "") if manager is not None else ""
+        folder = os.path.dirname(path) if path else os.path.join(HERE, "logs")
+        os.makedirs(folder, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _run(self, action):
+        if self._busy or self._closed:
+            return
+        manager = self._window.usb_manager()
+        if manager is None:
+            return
+        manager.auto_approve_vpn = self.auto_vpn.isChecked()
+        operation = {"scan": manager.discover_usb, "start": manager.start_all,
+                     "stop": manager.stop_all}[action]
+        self._busy = True
+        self._set_enabled(False)
+        self.status.setText(self.ACTIONS[action])
+        results = self._results
+
+        def work():
+            # Only this queue crosses back to the GUI thread.
+            try:
+                operation()
+                results.put((action, None))
+            except Exception as exc:
+                results.put((action, exc))
+
+        threading.Thread(target=work, name=f"usb-internet-{action}", daemon=True).start()
+
+    def _set_enabled(self, enabled):
+        available = self._window.usb_internet is not None
+        for widget in (self.scan_btn, self.start_btn, self.stop_btn, self.auto_vpn):
+            widget.setEnabled(enabled and available)
+
+    def _drain(self):
+        if self._closed:
+            return
+        self._ticks += 1
+        try:
+            action, failure = self._results.get_nowait()
+        except queue.Empty:
+            if self._ticks % 7 == 0:
+                self._refresh()           # the monitor updates states on its own
+            return
+        self._busy = False
+        self._set_enabled(True)
+        self._refresh()
+        if failure is not None:
+            self.status.setText(f"USB internet {action} failed unexpectedly: "
+                                f"{type(failure).__name__}. See the log below.")
+            return
+        self.status.setText(self._summary(action))
+
+    def _summary(self, action):
+        manager = self._window.usb_internet
+        snap = manager.snapshot() if manager is not None else {"devices": []}
+        states = [row.get("state") for row in snap.get("devices", [])]
+        online = states.count("vpn_active")
+        waiting = states.count("approval_required")
+        failed = sum(state in ("failed", "stop_failed", "unauthorized", "offline") for state in states)
+        if not states:
+            return ("No USB phones found. Connect them with data cables, enable USB "
+                    "debugging and accept the computer's key on each phone, then scan again.")
+        parts = [f"{len(states)} USB phone{'s' if len(states) != 1 else ''}"]
+        if online:
+            parts.append(f"{online} online via PC")
+        if waiting:
+            parts.append(f"{waiting} waiting for VPN approval")
+        if failed:
+            parts.append(f"{failed} need attention (see log)")
+        if action == "stop":
+            parts.append("USB internet stopped" if not snap.get("running") else "relay still running")
+        return " · ".join(parts)
+
+    def _refresh(self):
+        manager = self._window.usb_internet
+        self._set_enabled(not self._busy)
+        if manager is None:
+            return
+        snap = manager.snapshot()
+        net = snap.get("network") or {}
+        if net:
+            kind = {"wifi": "Wi‑Fi", "ethernet": "Ethernet"}.get(net.get("kind"), net.get("kind") or "")
+            where = f" ({kind}: {net.get('interface')})" if net.get("interface") else ""
+            color = C_TOXIC2 if net.get("ok") and net.get("kind") == "wifi" else (
+                C_HAZARD if net.get("ok") else C_BLOOD)
+            self.network.setText(("Computer internet ready" if net.get("ok") else
+                                  "Computer internet problem: " + str(net.get("message") or "")) + where)
+            self.network.setStyleSheet(f"color:{color};font-weight:600")
+        self.devices.clear()
+        for row in snap.get("devices", []):
+            label, color = self.STATES.get(row.get("state"), (str(row.get("state") or "unknown"), C_MUTE))
+            model = f" · {row['model']}" if row.get("model") else ""
+            item = QListWidgetItem(f"{row.get('serial')}{model}  —  {label}"
+                                   + (f"  ({row['detail']})" if row.get("detail") and
+                                      row.get("state") in ("failed", "stop_failed") else ""))
+            item.setForeground(QColor(color))
+            self.devices.addItem(item)
+        if not snap.get("devices"):
+            item = QListWidgetItem("No USB phones listed yet")
+            item.setForeground(QColor(C_FAINT))
+            self.devices.addItem(item)
+
+    def _on_finished(self, *_):
+        self._closed = True
+        self._poll.stop()
+        if getattr(self._window, "_usb_dialog", None) is self:
+            self._window._usb_dialog = None
+
+
 class UpdateDialog(QDialog):
     """Check and stage updates without touching Qt widgets from a worker."""
 
@@ -2578,6 +2839,18 @@ class ReactionGUI(QMainWindow):
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
         buttons.addStretch()
+        # USB reverse tethering: owned by the window so phones stay online
+        # after its dialog closes; stopped (and phones restored) on exit.
+        self.usb_internet = None
+        self._usb_dialog = None
+        self._usb_history = []
+        self._usb_helper_error = ""
+        self._usb_auto_vpn = True
+        self.usb_btn = GhostButton("USB internet")
+        self.usb_btn.setToolTip("Share this computer's internet with every phone on a "
+                                "USB cable (USB debugging on)")
+        self.usb_btn.clicked.connect(self.open_usb_internet)
+        buttons.addWidget(self.usb_btn)
         self.update_btn = GhostButton("Updates")
         self.update_btn.setToolTip("Install a published build, or go back to "
                                    "the previous one")
@@ -3006,7 +3279,9 @@ class ReactionGUI(QMainWindow):
             self._diagnostic_events.pop(0)
         self._diagnostic_errors = sum(e.get("severity", "error") == "error"
                                       for e in self._diagnostic_events)
-        self._diagnostic_warnings = len(self._diagnostic_events) - self._diagnostic_errors
+        # "info" notices (AI recovered, phone online) are shown, not counted.
+        self._diagnostic_warnings = sum(e.get("severity") not in ("error", "info", None)
+                                        for e in self._diagnostic_events)
         # Rebuild only at the bound so the plain-text view and Copy log agree.
         if len(self._diagnostic_events) == 500:
             self.diagnostics_log.setPlainText("\n\n".join(
@@ -3377,6 +3652,8 @@ class ReactionGUI(QMainWindow):
             self.workspace_save_error.show()
             event.ignore()
             return
+        # Phones on a stopped relay would keep a dead VPN and no internet.
+        self._shutdown_usb_internet()
         super().closeEvent(event)
 
     def resizeEvent(self, ev):
@@ -3655,6 +3932,8 @@ class ReactionGUI(QMainWindow):
         a = cmd.get("action")
         if a == "diagnostic":
             self._append_diagnostic(cmd.get("event") or {})
+        elif a == "usb_event":
+            self._on_usb_event(cmd.get("event") or {})
         elif a == "status":
             text = str(cmd.get("text", "")).upper()
             self.status_label.setText({"SPREADING…": "RUNNING", "PURGING…": "STOPPING"}.get(text, text))
@@ -3778,6 +4057,78 @@ class ReactionGUI(QMainWindow):
             return
         BackUpServ(self).exec()
         self.refresh_ai_status()
+
+    # ── USB internet (reverse tethering) ──
+    def usb_manager(self):
+        """The window's tethering manager, created on first use; None when the
+        bundled helpers are missing (usb_helper_error() says why)."""
+        if self.usb_internet is None:
+            try:
+                relay, apk = usb_internet.find_helpers()
+                self.usb_internet = usb_internet.USBInternetManager(
+                    fbcore.ADB, relay, apk, on_event=self._usb_event_from_worker,
+                    log_dir=os.path.join(HERE, "logs"), auto_approve_vpn=self._usb_auto_vpn)
+                self._usb_helper_error = ""
+            except Exception as exc:
+                self._usb_helper_error = f"{type(exc).__name__}: {exc}."
+                return None
+        return self.usb_internet
+
+    def usb_helper_error(self):
+        return self._usb_helper_error or "the helper files could not be loaded."
+
+    def _usb_event_from_worker(self, event):
+        # Manager threads never touch widgets: hop through the UI queue.
+        self.send_cmd({"action": "usb_event", "event": dict(event)})
+
+    def _on_usb_event(self, event):
+        self._usb_history.append(event)
+        del self._usb_history[:-500]
+        dialog = self._usb_dialog
+        if dialog is not None:
+            dialog.append_event(event)
+        if event.get("severity") in ("error", "warning"):
+            self._append_diagnostic({**event, "message": "USB internet: " + str(event.get("message") or "")})
+        self._refresh_usb_button()
+
+    def _refresh_usb_button(self):
+        manager = self.usb_internet
+        online = 0
+        if manager is not None:
+            try:
+                online = sum(row.get("state") == "vpn_active" for row in manager.snapshot()["devices"])
+            except Exception:
+                online = 0
+        self.usb_btn.setText(f"USB internet · {online}" if online else "USB internet")
+        self.usb_btn.setToolTip(f"{online} phone(s) online through this computer"
+                                if online else "Share this computer's internet with every phone "
+                                               "on a USB cable (USB debugging on)")
+
+    def open_usb_internet(self):
+        dialog = USBInternetDialog(self)
+        self._usb_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._usb_dialog = None
+            self._refresh_usb_button()
+
+    def _shutdown_usb_internet(self, wait=20.0):
+        """Stop every owned VPN and the relay so no phone is left without internet."""
+        manager, self.usb_internet = self.usb_internet, None
+        if manager is None:
+            return
+        done = threading.Event()
+
+        def stop():
+            try:
+                manager.close()
+            except Exception:
+                pass
+            finally:
+                done.set()
+        threading.Thread(target=stop, name="usb-internet-shutdown", daemon=True).start()
+        done.wait(wait)
 
     def refresh_ai_status(self):
         """Say plainly whether comments will actually be AI-generated.

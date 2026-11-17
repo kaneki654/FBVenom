@@ -23,6 +23,16 @@ class BuildCheckTests(unittest.TestCase):
         (self.bundle / "platform-tools").mkdir(parents=True)
         self.adb = self.bundle / "platform-tools" / "adb.exe"
         self.adb.write_bytes(b"mock adb")
+        (self.bundle / "gnirehtet").mkdir()
+        self.relay = self.bundle / "gnirehtet" / "gnirehtet.exe"
+        self.relay.write_bytes(b"mock relay")
+        (self.bundle / "gnirehtet" / "gnirehtet.apk").write_bytes(b"mock apk")
+        self.verify = Mock(side_effect=lambda directory, platform=None: {
+            "relay": str(Path(directory) / "gnirehtet.exe"),
+            "apk": str(Path(directory) / "gnirehtet.apk"),
+            "provenance": {"version": "2.5.1", "archive_sha256": "f" * 64}})
+        self.relay_output = ("Syntax: gnirehtet (install|uninstall|reinstall|run|autorun|start|stop|"
+                             "restart|tunnel|relay) ...\n\n  gnirehtet relay [-p PORT]\n")
         self.report_path = self.app / "smoke.json"
         self.require_key = Mock(side_effect=AssertionError("license UI must not run"))
         self.normalize = Mock(return_value="https://www.facebook.com/live/1234567890")
@@ -31,7 +41,9 @@ class BuildCheckTests(unittest.TestCase):
             app_icon_pixmap=Mock(return_value=pixmap), draw_symbiote=lambda: None,
             SymbioteBanner=object,
             BackUpServ=Mock(side_effect=AssertionError("packaging must not instantiate the server dialog")),
-            ReactionGUI=SimpleNamespace(_build_diagnostics=object, open_backup_server=lambda: None))
+            USBInternetDialog=Mock(side_effect=AssertionError("packaging must not open USB internet")),
+            ReactionGUI=SimpleNamespace(_build_diagnostics=object, open_backup_server=lambda: None,
+                                        open_usb_internet=lambda: None))
         self.modules = {
             "version": SimpleNamespace(APP_VERSION="1.1.1"),
             "aiconfig": SimpleNamespace(CONFIG_PATH=str(self.app / "venom_ai.json"), **{
@@ -45,6 +57,9 @@ class BuildCheckTests(unittest.TestCase):
             "PyQt6.QtWidgets": SimpleNamespace(QApplication=SimpleNamespace(instance=lambda: object())),
             "gui": gui,
             "auth": SimpleNamespace(require_key=self.require_key),
+            "usb_internet": SimpleNamespace(USBInternetManager=Mock(
+                side_effect=AssertionError("packaging must not start USB internet"))),
+            "tools_prepare_usb_internet": SimpleNamespace(verify_assets=self.verify),
         }
         self.patchers = [
             patch.dict(sys.modules, self.modules),
@@ -60,8 +75,14 @@ class BuildCheckTests(unittest.TestCase):
         self.adb_run = self._patch_run()
 
     def _patch_run(self):
-        item = patch.object(subprocess, "run", return_value=SimpleNamespace(
-            returncode=0, stdout="Android Debug Bridge version 1.0.41\nVersion test\n", stderr=""))
+        def run(command, **kwargs):
+            if Path(command[0]).name == "gnirehtet.exe":
+                # gnirehtet prints its syntax on stderr when given no command.
+                return SimpleNamespace(returncode=0, stdout="", stderr=self.relay_output)
+            return self.adb_result
+        self.adb_result = SimpleNamespace(
+            returncode=0, stdout="Android Debug Bridge version 1.0.41\nVersion test\n", stderr="")
+        item = patch.object(subprocess, "run", side_effect=run)
         result = item.start()
         self.addCleanup(item.stop)
         return result
@@ -83,11 +104,44 @@ class BuildCheckTests(unittest.TestCase):
                      "build_lan_profile", "validate_lan_connection", "get_local_lan_key"):
             getattr(self.modules["aiconfig"], name).assert_not_called()
         self.assertFalse((self.app / "venom_ai.json").exists())
-        args, kwargs = self.adb_run.call_args
-        self.assertEqual(args[0], [str(self.adb), "version"])
-        self.assertEqual(kwargs["timeout"], 10)
-        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        (adb_call, relay_call) = self.adb_run.call_args_list
+        self.assertEqual(adb_call.args[0], [str(self.adb), "version"])
+        self.assertEqual(adb_call.kwargs["timeout"], 10)
+        self.assertEqual(adb_call.kwargs["stdin"], subprocess.DEVNULL)
+        # The relay is only asked for its syntax: no command, no ADB, no phones.
+        self.assertEqual(relay_call.args[0], [str(self.relay)])
+        self.assertEqual(relay_call.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(relay_call.kwargs["timeout"], 10)
+        self.assertTrue(report["usb_internet_bundled"])
+        self.assertTrue(report["usb_relay_cli_ok"])
+        self.assertEqual(report["usb_internet"], {"version": "2.5.1", "archive_sha256": "f" * 64})
+        self.verify.assert_called_once_with(str(self.bundle / "gnirehtet"), platform="windows")
+        self.modules["usb_internet"].USBInternetManager.assert_not_called()
+        self.modules["gui"].USBInternetDialog.assert_not_called()
         self.normalize.assert_called_once_with("https://m.facebook.com/live/1234567890/?fbclid=build-check")
+
+    def test_relay_that_does_not_print_gnirehtet_syntax_fails_the_build(self):
+        for output in ("", "usage: something else entirely", "Syntax: gnirehtet (install) ..."):
+            with self.subTest(output=output):
+                self.relay_output = output
+                self.assertEqual(fbvenom.run_build_check(), 2)
+                self.assertFalse(self.report()["usb_relay_cli_ok"])
+                self.assertIn("usb_relay_cli_ok", self.report()["failed_checks"])
+
+    def test_unverified_usb_internet_helpers_fail_the_build_without_running_them(self):
+        self.verify.side_effect = ValueError("USB Internet helper hash or size mismatch: gnirehtet.exe")
+        self.assertEqual(fbvenom.run_build_check(), 2)
+        report = self.report()
+        self.assertFalse(report["usb_internet_bundled"])
+        self.assertIn("usb_internet_bundled", report["failed_checks"])
+        self.assertTrue(any("hash or size mismatch" in error for error in report["errors"]))
+        self.assertEqual([call.args[0][0] for call in self.adb_run.call_args_list], [str(self.adb)])
+
+    def test_gui_without_usb_internet_button_is_rejected(self):
+        with patch.object(self.modules["gui"], "USBInternetDialog", None):
+            self.assertEqual(fbvenom.run_build_check(), 2)
+        self.assertFalse(self.report()["gui_features"]["usb_internet"])
+        self.assertIn("updated_features", self.report()["failed_checks"])
 
     def test_source_or_non_windows_cannot_pass_or_execute_adb(self):
         with patch.object(sys, "frozen", False), patch.object(sys, "platform", "linux"):
@@ -108,7 +162,7 @@ class BuildCheckTests(unittest.TestCase):
         self.adb_run.assert_not_called()
 
     def test_adb_failure_and_timeout_are_reported_before_nonzero_exit(self):
-        self.adb_run.return_value = SimpleNamespace(returncode=1, stdout="", stderr="Missing DLL")
+        self.adb_result = SimpleNamespace(returncode=1, stdout="", stderr="Missing DLL")
         self.assertEqual(fbvenom.run_build_check(), 2)
         self.assertEqual(self.report()["adb_returncode"], 1)
         self.assertFalse(self.report()["adb_version_ok"])
@@ -151,9 +205,11 @@ class WindowsBuildFeatureValidationTests(unittest.TestCase):
             report = {
                 "ok": True, "app_version": "1.1.1", "adb_version": "test adb",
                 **{name: True for name in ("frozen", "windows", "adb_bundled", "adb_version_ok",
-                   "icon_loaded", "config_beside_exe", "app_beside_exe", "auth_imported")},
+                   "icon_loaded", "config_beside_exe", "app_beside_exe", "auth_imported",
+                   "usb_internet_bundled", "usb_relay_cli_ok")},
                 "gui_features": {name: True for name in ("live_link_normalization", "structured_errors",
-                    "venom_theme", "diagnostics_panel")},
+                    "venom_theme", "diagnostics_panel", "usb_internet")},
+                "usb_internet": {"version": "2.5.1", "archive_sha256": "f" * 64},
             }
             def frozen_check(*args, **kwargs):
                 Path(kwargs["env"]["FBVENOM_BUILD_CHECK_PATH"]).write_text(json.dumps(report), encoding="utf-8")
@@ -171,6 +227,14 @@ class WindowsBuildFeatureValidationTests(unittest.TestCase):
                 validated = build_validator.validate(path, "source-commit")
                 self.assertTrue(validated["gui_features"]["backup_server"])
                 self.assertEqual(validated["source_commit"], "source-commit")
+                self.assertEqual(validated["usb_internet"]["version"], "2.5.1")
+                report["gui_features"]["usb_internet"] = False
+                with self.assertRaisesRegex(RuntimeError, "required application features"):
+                    build_validator.validate(path, "source-commit")
+                report["gui_features"]["usb_internet"] = True
+                report["usb_relay_cli_ok"] = False
+                with self.assertRaisesRegex(RuntimeError, "required packaging checks"):
+                    build_validator.validate(path, "source-commit")
 
 
 if __name__ == "__main__":

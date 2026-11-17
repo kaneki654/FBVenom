@@ -9,6 +9,7 @@ if sys.platform != "win32":
         "Run this spec on Windows; a Linux build is not a Windows executable.")
 
 from PyInstaller.utils.hooks import collect_all
+from tools_prepare_usb_internet import verify_assets
 
 ROOT = Path(SPEC).resolve().parent
 
@@ -52,6 +53,14 @@ for name in ("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"):
 notice = tools_dir / "NOTICE.txt"
 if notice.is_file():
     datas.append((str(notice), "platform-tools"))
+
+gnirehtet_dir = Path(os.environ.get("FBVENOM_GNIREHTET_DIR") or
+                     str(ROOT / "gnirehtet")).expanduser().resolve()
+usb_assets = verify_assets(gnirehtet_dir, platform="windows")
+require_windows_binary(Path(usb_assets["relay"]))
+binaries.append((usb_assets["relay"], "gnirehtet"))
+for name in ("gnirehtet.apk", "LICENSE", "provenance.json"):
+    datas.append((str(gnirehtet_dir / name), "gnirehtet"))
 
 hiddenimports = []
 for package in ("uiautomator2", "adbutils", "PIL"):

@@ -30,9 +30,10 @@ from updater import DEFAULT_MANIFEST_URL, GITHUB_REPO, UpdateError, _check_locat
 
 
 _REQUIRED_CHECKS = ("frozen", "windows", "adb_bundled", "adb_version_ok", "icon_loaded",
-                    "config_beside_exe", "app_beside_exe", "auth_imported")
+                    "config_beside_exe", "app_beside_exe", "auth_imported",
+                    "usb_internet_bundled", "usb_relay_cli_ok")
 _REQUIRED_FEATURES = ("live_link_normalization", "structured_errors", "venom_theme",
-                      "diagnostics_panel", "backup_server")
+                      "diagnostics_panel", "backup_server", "usb_internet")
 
 
 def sha256_of(path):

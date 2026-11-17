@@ -27,6 +27,10 @@ def run_build_check():
         "adb_bundled": False,
         "adb_version_ok": False,
         "adb_version": "",
+        "usb_internet_bundled": False,
+        "usb_relay_cli_ok": False,
+        "usb_relay_cli": "",
+        "usb_internet": {},
         "icon_loaded": False,
         "icon_size": [0, 0],
         "pillow": "",
@@ -91,6 +95,36 @@ def run_build_check():
         report["imports"]["core"] = False
         failed("core import/check", exc)
     try:
+        import usb_internet
+        from tools_prepare_usb_internet import verify_assets
+        report["imports"]["usb_internet"] = callable(getattr(usb_internet, "USBInternetManager", None))
+        bundle = getattr(sys, "_MEIPASS", "")
+        if bundle and report["frozen"] and report["windows"]:
+            directory = os.path.join(bundle, "gnirehtet")
+            assets = verify_assets(directory, platform="windows")
+            relay = os.path.join(directory, "gnirehtet.exe")
+            apk = os.path.join(directory, "gnirehtet.apk")
+            report["usb_internet_bundled"] = (
+                same_path(assets["relay"], relay) and same_path(assets["apk"], apk)
+                and os.path.isfile(relay) and os.path.isfile(apk))
+            report["usb_internet"] = {name: assets["provenance"][name]
+                                      for name in ("version", "archive_sha256")}
+            if report["usb_internet_bundled"] and report["adb_bundled"]:
+                # With no command, gnirehtet 2.5.1's main() only calls
+                # print_usage() (stderr, exit 0): it starts no relay, invokes no
+                # ADB and changes no phone or network state. Its text begins
+                # "Syntax: gnirehtet (" and never contains the word "usage".
+                result = subprocess.run([relay], stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, encoding="utf-8",
+                                        errors="replace", timeout=10, check=False, cwd=directory)
+                output = (result.stdout or "") + (result.stderr or "")
+                report["usb_relay_cli"] = output.strip()[:2000]
+                report["usb_relay_cli_ok"] = (result.returncode in (0, 1)
+                    and "syntax: gnirehtet" in output.lower() and "relay" in output.lower())
+    except Exception as exc:
+        report["imports"]["usb_internet"] = False
+        failed("USB Internet import/assets/check", exc)
+    try:
         from PIL import Image
         report["imports"]["Pillow"] = True
         report["pillow"] = getattr(Image, "__version__", "ok")
@@ -115,6 +149,10 @@ def run_build_check():
             and all(callable(getattr(aiconfig, name, None)) for name in (
                 "get_server_mode", "set_server_mode", "get_lan_profile",
                 "build_lan_profile", "validate_lan_connection", "get_local_lan_key")))
+        report["gui_features"]["usb_internet"] = (
+            callable(getattr(usb_internet, "USBInternetManager", None))
+            and callable(getattr(gui, "USBInternetDialog", None))
+            and callable(getattr(gui.ReactionGUI, "open_usb_internet", None)))
     except Exception as exc:
         report["imports"]["gui"] = False
         failed("GUI import/check", exc)
@@ -129,12 +167,13 @@ def run_build_check():
 
     checks = {name: report[name] for name in (
         "frozen", "windows", "config_beside_exe", "app_beside_exe",
-        "adb_exists", "adb_bundled", "adb_version_ok", "icon_loaded", "auth_imported")}
+        "adb_exists", "adb_bundled", "adb_version_ok", "icon_loaded", "auth_imported",
+        "usb_internet_bundled", "usb_relay_cli_ok")}
     checks["app_version"] = bool(report["app_version"])
     checks["imports"] = all(report["imports"].values())
     checks["updated_features"] = all(report["gui_features"].get(name, False) for name in (
         "live_link_normalization", "structured_errors", "venom_theme", "diagnostics_panel",
-        "backup_server"))
+        "backup_server", "usb_internet"))
     report["failed_checks"] = [name for name, passed in checks.items() if not passed]
     report["ok"] = not report["failed_checks"] and not report["errors"]
     out = os.environ.get(

@@ -29,6 +29,11 @@ def completion(text="a fresh comment"):
     return io.BytesIO(json.dumps({"choices": [{"message": {"content": text}}]}).encode())
 
 
+def fresh_breaker():
+    return {"failures": 0, "open": False, "since": 0.0, "reason": "",
+            "generation": 0, "probing": False, "said": set()}
+
+
 class ServerModeRoutingTests(unittest.TestCase):
     def setUp(self):
         self.patches = ExitStack()
@@ -49,6 +54,8 @@ class ServerModeRoutingTests(unittest.TestCase):
         self.patches.enter_context(patch.object(core, "_poll_dead", [False]))
         self.patches.enter_context(patch.object(core, "_no_sampling", {}))
         self.patches.enter_context(patch.object(core, "_pool_by_link", {}))
+        self.patches.enter_context(patch.object(core, "_ai_breaker", fresh_breaker()))
+        self.probe = self.patches.enter_context(patch.object(core, "_start_ai_probe"))
 
     def assert_no_external_calls(self):
         self.network.assert_not_called()
@@ -77,8 +84,10 @@ class ServerModeRoutingTests(unittest.TestCase):
 
     def test_lan_without_key_is_still_contacted_instead_of_external_fallback(self):
         self.config.return_value = {**LAN_CONFIG, "api_key": ""}
-        self.assertFalse(core.start_llama())
+        # A refused start-up check opens the shared breaker, so the reply is
+        # asked first: both must reach the LAN gateway and nothing external.
         self.assertEqual(core.ai_reply("hello", retries=1), "")
+        self.assertFalse(core.start_llama())
         self.assertEqual(self.lan_network.call_count, 2)
         self.assert_no_external_calls()
 
