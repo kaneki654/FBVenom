@@ -249,8 +249,16 @@ never changes adapters or routes.
 Phones stay online after the window closes. **Stop all**, or closing FBVenom,
 stops every VPN it started and removes its USB tunnels, so no phone is left on a
 dead connection. Tunnels and VPNs left behind by a crashed session are cleaned
-up on the next start; another tool's tunnel or VPN is never touched. The relay
-listens only on `127.0.0.1`.
+up on the next start, and every run also switches off such a leftover VPN on
+each phone before opening posts; another tool's tunnel or VPN is never touched.
+The relay listens only on `127.0.0.1`.
+
+While USB internet is on, rescanning devices and starting a run never restart
+the ADB server, because every phone's tunnel lives inside it. Unauthorized
+phones no longer trigger ADB restarts at all: accept the debugging prompt on the
+phone instead. The background check confirms each tunnel every pass, but asks
+the phone itself about its VPN only every 20 seconds, or straight after
+repairing its tunnel, so low-end phones are not kept busy.
 
 Every event is shown in the window's log, copied to Diagnostics when it is a
 warning or error, and saved as JSON lines in `logs/venom_usb_internet.log`
@@ -374,7 +382,30 @@ Normalization cannot grant access to private, deleted, expired or restricted
 content, or enable comments where Facebook has disabled them. Profiles, feeds
 and content collections do not identify a single comment target. If a short
 link cannot be resolved, its cleaned original is retained and a warning explains
-the fallback.
+the fallback. A failed resolution is retried after five minutes instead of
+being remembered until the app restarts.
+
+### Opening the post on the phone
+
+- Links are quoted for the phone's shell, so `permalink.php?story_fbid=…&id=…`,
+  `story.php?…&id=…` and `photo?fbid=…&set=…` reach Facebook Lite whole. Before
+  1.1.7 the phone's shell cut them at the `&` and every HTTPS opener for them
+  failed.
+- Each opener gets up to 15 seconds to show the post, so a slow connection no
+  longer makes FBVenom close Facebook Lite just before the post appears and
+  start it again. A link that lands on the news feed still moves on after
+  4 seconds of feed.
+- When a post will not open, the phone's status bar is checked. If Android
+  says the connection has **No internet**, the run reports `PHONE_NO_INTERNET`
+  and waits up to two minutes for the connection, instead of reopening Facebook
+  Lite over and over.
+- A USB internet VPN left behind with nothing serving it (a crashed or killed
+  session, a sleeping PC) is switched off when each phone starts and whenever a
+  post will not open, so the phone gets its own Wi‑Fi back
+  (`USB_VPN_STALE_STOPPED`).
+- If a post still cannot be verified, the phone's screen is saved once per
+  phone and link to the `debug` folder
+  (`<serial>_target_not_verified_<time>.png/.xml`).
 
 ## Error diagnostics
 
@@ -385,6 +416,7 @@ is disabled. The log rotates after 5 MB. Common credentials in structured error
 details are redacted.
 
 Examples include `DEVICE_UNAUTHORIZED`, `ADB_TIMEOUT`, `TARGET_OPEN_FAILED`,
+`TARGET_NOT_VERIFIED`, `PHONE_NO_INTERNET`, `USB_VPN_STALE_STOPPED`,
 `COMMENT_NO_BOX`, `COMMENT_NOT_TYPED`, `ACTION_BLOCKED` and
 `COMMENT_SUBMIT_UNVERIFIED`. A comment is confirmed only after its draft clears
 from an observable composer on the post. If a send was attempted but cannot be

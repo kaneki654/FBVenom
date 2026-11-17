@@ -2846,6 +2846,9 @@ class ReactionGUI(QMainWindow):
         self._usb_history = []
         self._usb_helper_error = ""
         self._usb_auto_vpn = True
+        # The core must not restart ADB or stop Gnirehtet VPNs while this
+        # window's USB internet is sharing the connection through them.
+        fbcore.USB_INTERNET_ACTIVE = self.usb_internet_running
         self.usb_btn = GhostButton("USB internet")
         self.usb_btn.setToolTip("Share this computer's internet with every phone on a "
                                 "USB cable (USB debugging on)")
@@ -4076,6 +4079,16 @@ class ReactionGUI(QMainWindow):
 
     def usb_helper_error(self):
         return self._usb_helper_error or "the helper files could not be loaded."
+
+    def usb_internet_running(self):
+        """True while this window's relay is up (any thread may ask)."""
+        manager = self.usb_internet
+        if manager is None:
+            return False
+        try:
+            return bool(manager.snapshot().get("running"))
+        except Exception:
+            return False
 
     def _usb_event_from_worker(self, event):
         # Manager threads never touch widgets: hop through the UI queue.

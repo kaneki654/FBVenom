@@ -22,6 +22,7 @@ import uuid
 PACKAGE = "com.genymobile.gnirehtet"
 SOCKET_NAME = "localabstract:gnirehtet"
 MAX_DISCOVERY = 1024 * 1024
+VPN_RECHECK_SECONDS = 20.0
 _STATE_NAMES = {3: "unauthorized", 4: "no permissions", 6: "offline", 8: "device", 10: "recovery", 11: "sideload"}
 _HINTS = {
     "TETHER_NO_USB_DEVICES": "Connect phones with USB data cables, enable USB debugging, and accept the computer's debugging key.",
@@ -182,6 +183,7 @@ class USBInternetManager:
         self.log_path = ""
         self._lock, self._operation_lock = threading.RLock(), threading.RLock()
         self._devices, self._owned = {}, {}
+        self._vpn_checked = {}       # serial -> monotonic time of last VPN check
         self._relay, self._port, self._busy = None, None, False
         self._last_error, self._network = "", {}
         self._closed = False
@@ -659,6 +661,7 @@ class USBInternetManager:
         finally:
             with self._lock:
                 self._owned.pop(serial, None)
+            self._vpn_checked.pop(serial, None)
 
     def _stop_relay(self):
         with self._lock:
@@ -730,17 +733,27 @@ class USBInternetManager:
                     self._emit("TETHER_DEVICE_DISCONNECTED", "USB phone disconnected or is not ready", serial, severity="warning")
                 continue
             target = self._reverse_target(serial)
+            restored = False
             if target is None:
                 code, _, error = self._command([self.relay_path, "tunnel", serial, "-p", str(self._port)], timeout=8)
                 if code:
                     self._emit("TETHER_START_FAILED", "Could not restore the USB tunnel", serial, error, severity="warning")
                     continue
+                restored = True
             elif target != f"tcp:{self._port}":
                 self._emit("TETHER_OWNERSHIP_CHANGED", "Changed USB tunnel left untouched", serial, severity="warning")
                 with self._lock:
                     self._owned.pop(serial, None)
                 self._device_state(serial, "unmanaged", "Another tool owns this USB tunnel")
                 continue
+            # The tunnel check above is one cheap call and runs every pass. The
+            # VPN check is two `dumpsys` runs ON the phone; doing them every
+            # pass for every phone kept low-end phones busy the whole session,
+            # right while Facebook Lite was loading posts on them.
+            now = time.monotonic()
+            if not restored and now - self._vpn_checked.get(serial, float("-inf")) < VPN_RECHECK_SECONDS:
+                continue
+            self._vpn_checked[serial] = now
             active = self._vpn_active(serial)
             self._device_state(serial, "vpn_active" if active else "approval_required",
                                "Online through the PC's internet" if active else "Waiting for Android VPN approval")

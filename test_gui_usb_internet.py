@@ -168,6 +168,15 @@ class USBInternetGuiTests(unittest.TestCase):
         self.assertTrue(manager.closed.is_set())
         self.assertIsNone(self.window.usb_internet)
 
+    def test_core_is_told_while_usb_internet_runs_so_it_never_restarts_adb(self):
+        self.assertIs(gui.fbcore.USB_INTERNET_ACTIVE.__self__, self.window)
+        self.assertFalse(gui.fbcore.usb_internet_active())        # nothing started yet
+        manager = self.window.usb_manager()
+        manager.start_all()
+        self.assertTrue(gui.fbcore.usb_internet_active())
+        manager.stop_all()
+        self.assertFalse(gui.fbcore.usb_internet_active())
+
     def test_info_notices_are_not_counted_as_warnings(self):
         self.window._append_diagnostic({"code": "AI_RECOVERED", "severity": "info", "message": "back"})
         self.window._append_diagnostic({"code": "AI_SLOW", "severity": "warning", "message": "slow"})

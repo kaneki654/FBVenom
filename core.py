@@ -4649,18 +4649,33 @@ def list_devices():
             devices[serial] = state or "unknown"
     return devices
 
+_RECOVERABLE_STATES = ("offline", "unknown")
+
+
 def ensure_online():
+    """Device list after trying to bring offline phones back.
+
+    Only offline/unknown phones can be recovered from the PC. An UNAUTHORIZED
+    phone waits for its owner to accept the debugging prompt, yet it used to
+    trigger up to three ADB server restarts on every rescan and every workspace
+    Start - each one disconnecting every other phone and, with USB internet on,
+    cutting every phone's internet just as the run began.
+    """
     devices = list_devices()
     for attempt in range(1, RECOVER_RETRIES + 1):
-        bad = {s: st for s, st in devices.items()
-               if st in ("offline", "unauthorized", "unknown")}
+        bad = {s: st for s, st in devices.items() if st in _RECOVERABLE_STATES}
         if not bad:
             break
         print(f"[recover] attempt {attempt}: {len(bad)} phone(s) not ready, trying to recover...")
         run(["reconnect", "offline"])
         time.sleep(2)
         devices = list_devices()
-        if any(st in ("offline", "unauthorized", "unknown") for st in devices.values()):
+        if any(st in _RECOVERABLE_STATES for st in devices.values()):
+            if usb_internet_active():
+                # The USB internet tunnels live inside the ADB server.
+                print("[recover] not restarting ADB while USB internet is on - "
+                      "every phone would lose its connection.")
+                break
             run(["kill-server"])
             run(["start-server"])
             time.sleep(3)
@@ -5130,7 +5145,14 @@ _ERROR_HELP = {
     "SHARE_UNRESOLVED": ("The shared link could not be resolved on this computer.",
                          "The original link will still be tried on the phone; if it fails, copy the content's direct permalink from Facebook."),
     "TARGET_NOT_VERIFIED": ("The requested post view could not be verified.",
-                            "Check the phone is on the intended content and has access; this link was skipped."),
+                            "Check the phone is on the intended content and has access; this link was skipped. "
+                            "The phone's screen is saved in the debug folder."),
+    "PHONE_NO_INTERNET": ("The phone says its connection has no internet.",
+                          "Check this phone's Wi-Fi or mobile data and the router; the post is retried "
+                          "as soon as the connection returns."),
+    "USB_VPN_STALE_STOPPED": ("Turned off a leftover USB internet VPN that had nothing behind it.",
+                              "The phone is back on its own Wi-Fi. Start USB internet again if you "
+                              "want it to use this computer's connection."),
     "COMMENT_EMPTY": ("There is no comment text to enter.",
                       "Add an example comment for this link."),
     "COMMENT_NO_BOX": ("A comment composer could not be found.",
@@ -5596,13 +5618,21 @@ def has_comment_composer(d):
     return False
 
 
-def on_post_view(d, timeout=0.0):
+def on_post_view(d, timeout=0.0, feed_grace=None):
     """True only when a single post (or reel) is on screen — never the feed.
 
     Waits up to `timeout` seconds for the view to settle. Returns False the
     moment Abort is pressed.
+
+    `feed_grace`: give up early once the NEWS FEED has stayed on screen this
+    many seconds. A deep link can flash the feed before it pushes the post, so
+    a moment of feed is not proof - but a feed that stays put is, and waiting
+    out a long `timeout` there only delays trying the next opener. That is what
+    lets the post-open check be patient with a SLOW post without being slow on
+    a link that landed on the feed.
     """
     deadline = time.time() + max(0.0, timeout)
+    feed_since = None
     while True:
         if stop_requested():
             return False
@@ -5613,6 +5643,13 @@ def on_post_view(d, timeout=0.0):
         # Feed veto first: if the home/feed status composer is on screen we are
         # NOT on the post, so never let a marker (or the reel check) say we are.
         on_feed = any(f in text for f in FEED_MARKERS)
+        if on_feed and feed_grace is not None:
+            now = time.time()
+            feed_since = now if feed_since is None else feed_since
+            if now - feed_since >= feed_grace:
+                return False
+        elif not on_feed:
+            feed_since = None
         if not on_feed:
             try:
                 if find_reel_like_point(d) is not None:
@@ -5631,7 +5668,9 @@ def on_post_view(d, timeout=0.0):
             return False
 
 _url_resolve_cache = {}
+_url_resolve_failed_at = {}
 _url_resolve_lock = threading.Lock()
+SHARE_RETRY_AFTER = 300.0
 _FB_CONTENT_ID = r"(?:\d+|pfbid[0-9A-Za-z]+)"
 _SHARE_TOKEN_RE = re.compile(r"^/share/(?:[a-z]/)?[^/?#]+/?$", re.I)
 
@@ -5843,7 +5882,13 @@ def _canonicalize_fb_url(url):
         return url
     with _url_resolve_lock:
         if url in _url_resolve_cache:
-            return _url_resolve_cache[url]
+            # A failure is only remembered briefly: it used to stick for the
+            # life of the app, so one network blip at Start sent the raw share
+            # link - which Facebook Lite often opens on the feed - to every
+            # phone in every later run until the app was restarted.
+            failed_at = _url_resolve_failed_at.get(url)
+            if failed_at is None or time.monotonic() - failed_at < SHARE_RETRY_AFTER:
+                return _url_resolve_cache[url]
     resolved = url
     last_failure = "Facebook exposed no usable single-content permalink."
     # A share token carries its answer in the body, so HEAD can never resolve
@@ -5874,6 +5919,10 @@ def _canonicalize_fb_url(url):
             break
     with _url_resolve_lock:
         _url_resolve_cache[url] = resolved
+        if resolved == url:
+            _url_resolve_failed_at[url] = time.monotonic()
+        else:
+            _url_resolve_failed_at.pop(url, None)
     if resolved != url:
         print(f"  [link] resolved share/redirect -> {resolved[:80]}")
     else:
@@ -5954,27 +6003,193 @@ FB_LINK_ALIASES = (
 )
 
 
+_SHELL_SAFE_ARG = re.compile(r"[A-Za-z0-9_@%+=:,./-]+")
+
+
+def _device_shell_quote(value):
+    """Quote one argument for the phone's own shell.
+
+    `adb shell a b c` joins its arguments with spaces and hands that line to the
+    phone's /system/bin/sh WITHOUT escaping anything (adb does this on purpose,
+    "just like ssh"). A link such as
+
+        https://www.facebook.com/permalink.php?story_fbid=1&id=2
+
+    was therefore cut at the `&`: the phone ran `am start ... story_fbid=1` in
+    the background and then tried to run `id=2 -f 0x14000000` as a command
+    ("-f: not found"). Every https opener for permalink.php, story.php and
+    photo?fbid=..&set=.. links failed that way, before Facebook Lite ever saw
+    the whole link. Single quotes keep the link one argument.
+    """
+    text = str(value)
+    if _SHELL_SAFE_ARG.fullmatch(text):
+        return text
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
 def _post_view_attempts(uri):
+    data = _device_shell_quote(uri)
     is_fb_scheme = uri.startswith(("fb://", "facebook://"))
     if is_fb_scheme:
         return [
             ["shell", "am", "start", "-a", "android.intent.action.VIEW",
-             "-d", uri, "-p", FB_PACKAGE, "-f", "0x14000000"],
-            ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", uri],
+             "-d", data, "-p", FB_PACKAGE, "-f", "0x14000000"],
+            ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", data],
         ]
     attempts = [
         ["shell", "am", "start", "-n", f"{FB_PACKAGE}/{alias}",
-         "-a", "android.intent.action.VIEW", "-d", uri, "-f", "0x14000000"]
+         "-a", "android.intent.action.VIEW", "-d", data, "-f", "0x14000000"]
         for alias in FB_LINK_ALIASES
     ]
-    attempts.append(
-        ["shell", "am", "start", "-n", FB_ACTIVITY,
-         "-a", "android.intent.action.VIEW", "-d", uri, "-f", "0x14000000"])
+    # Package-scoped VIEW before MainActivity: MainActivity is measured to
+    # ignore the link and open the news feed, and open_post() only judges the
+    # FIRST opener that starts without an error, so with MainActivity ahead of
+    # it this one could never run when a build lacks both aliases. With the
+    # aliases present (the normal case) neither of these is ever reached.
     attempts.append(
         ["shell", "am", "start", "--activity-single-top",
          "-a", "android.intent.action.VIEW",
-         "-d", uri, "-p", FB_PACKAGE, "-f", "0x14000000"])
+         "-d", data, "-p", FB_PACKAGE, "-f", "0x14000000"])
+    attempts.append(
+        ["shell", "am", "start", "-n", FB_ACTIVITY,
+         "-a", "android.intent.action.VIEW", "-d", data, "-f", "0x14000000"])
     return attempts
+
+# How long one opener may take to show the post once Facebook is up. Facebook
+# Lite draws its screens from the server, so on a slow or congested connection
+# a cold start can need well over 6 s; the old 6 s check force-stopped the app
+# just before the post arrived and started it again - over and over, which is
+# what "it can't open Facebook Lite" looks like on the phone. A link that lands
+# on the news feed still fails fast: the feed only gets OPEN_FEED_GRACE.
+OPEN_VERIFY_SECONDS = 15.0
+OPEN_FEED_GRACE = 4.0
+
+# ── Phone connectivity ─────────────────────────────────────────────────────
+# Android's status bar names a connection without internet in the icon's
+# description; the fleet's own dumps show "Wifi signal full.,No internet".
+_NO_INTERNET_RE = re.compile(
+    r'content-desc="[^"]*\b(?:no internet|walang internet)\b', re.I)
+PHONE_OFFLINE_WAIT = 120.0
+GNIREHTET_PACKAGE = "com.genymobile.gnirehtet"
+GNIREHTET_SOCKET = "localabstract:gnirehtet"
+# Set by the GUI: a callable that is True while this app's USB internet is
+# sharing the PC's connection. Its tunnels live inside the ADB server and its
+# VPNs belong to it, so nothing here restarts that server or stops those VPNs
+# while it runs.
+USB_INTERNET_ACTIVE = None
+
+
+def usb_internet_active():
+    hook = USB_INTERNET_ACTIVE
+    if not hook:
+        return False
+    try:
+        return bool(hook())
+    except Exception:
+        return False
+
+
+def phone_reports_no_internet(d):
+    """True when the phone's own status bar says its connection has no internet."""
+    try:
+        xml = d.dump_hierarchy()
+    except Exception:
+        return False
+    return bool(xml) and bool(_NO_INTERNET_RE.search(xml))
+
+
+def wait_for_phone_internet(serial, d, max_wait=None):
+    """Hold off while the phone says it has no internet, instead of reopening.
+
+    Every reopen force-stops Facebook Lite, and a phone without internet cannot
+    load any post, so retrying only burns the link's attempts (and then the
+    account's) while saying nothing useful. Returns True when the phone is
+    online - or its status bar cannot be read - and False when it stayed
+    offline for `max_wait` seconds or Abort was pressed.
+    """
+    if not phone_reports_no_internet(d):
+        return True
+    limit = PHONE_OFFLINE_WAIT if max_wait is None else float(max_wait)
+    report_error("PHONE_NO_INTERNET", serial, severity="warning",
+                 detail=f"Waiting up to {int(limit)}s for the connection to return.")
+    deadline = time.monotonic() + limit
+    while time.monotonic() < deadline:
+        if not abort_sleep(5.0):
+            return False
+        if not phone_reports_no_internet(d):
+            print(f"    [{serial}] the phone's internet is back.")
+            return True
+    return False
+
+
+def _usb_tunnel_target(serial):
+    """The PC end of this phone's Gnirehtet tunnel ("tcp:PORT"), or None."""
+    rc, out, _ = run(["reverse", "--list"], serial=serial, timeout=10)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if GNIREHTET_SOCKET in parts:
+            index = parts.index(GNIREHTET_SOCKET)
+            return parts[index + 1] if index + 1 < len(parts) else "unknown"
+    return None
+
+
+def _local_port_answers(port):
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.5):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def stop_stale_usb_vpn(serial):
+    """Turn off a USB-internet VPN that no live relay is serving.
+
+    Gnirehtet's VPN sends ALL of the phone's traffic down the USB tunnel. When
+    the relay behind it is gone - FBVenom crashed or was killed, the PC slept,
+    or the ADB server restarted and took the tunnel with it - the phone keeps
+    the VPN up with nothing on the other end: Wi-Fi still looks connected but
+    Facebook Lite cannot load anything, so every post "fails to open".
+
+    Left alone: this app's own running USB internet (it manages its VPNs), and
+    any tunnel whose PC port still answers (a live relay, maybe another tool).
+    Returns True when a stale VPN was stopped.
+    """
+    if usb_internet_active():
+        return False
+    rc, out, _ = run(["shell", "dumpsys", "activity", "services", GNIREHTET_PACKAGE],
+                     serial=serial, timeout=15)
+    if rc != 0 or not re.search(r"ServiceRecord\{[^\n]*com\.genymobile\.gnirehtet/", out):
+        return False
+    target = _usb_tunnel_target(serial)
+    if target is not None:
+        match = re.fullmatch(r"tcp:(\d{1,5})", target)
+        if not match or _local_port_answers(match.group(1)):
+            return False
+    run(["shell", "am", "start", "-a", "com.genymobile.gnirehtet.STOP",
+         "-n", f"{GNIREHTET_PACKAGE}/.GnirehtetActivity"], serial=serial)
+    if target is not None:
+        run(["reverse", "--remove", GNIREHTET_SOCKET], serial=serial)
+    report_error("USB_VPN_STALE_STOPPED", serial, severity="warning",
+                 detail=("Its USB tunnel pointed at " + target + ", where nothing answers."
+                         if target else "It had no USB tunnel at all."))
+    return True
+
+
+_open_failure_dumps = set()
+_open_failure_lock = threading.Lock()
+
+
+def _save_open_failure(serial, d, url):
+    """Save the screen once per phone and link when a post will not open."""
+    key = (str(serial), str(url))
+    with _open_failure_lock:
+        if key in _open_failure_dumps:
+            return None
+        _open_failure_dumps.add(key)
+    return dump_debug(serial, d, "target_not_verified")
+
 
 def open_post(serial, url, allow_warm=True, verify=None):
     # Never (re)launch Facebook once Abort has been pressed.
@@ -6078,7 +6293,9 @@ def open_target_post(serial, d, url, attempts=3):
             # would force-stop a post that actually opened and loop forever.
             opened = open_post(
                 serial, url, allow_warm=warm,
-                verify=lambda: on_post_view(d, timeout=6.0) or dump_is_blind(d))
+                verify=lambda: (on_post_view(d, timeout=OPEN_VERIFY_SECONDS,
+                                             feed_grace=OPEN_FEED_GRACE)
+                                or dump_is_blind(d)))
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             opened = False
@@ -6102,6 +6319,22 @@ def open_target_post(serial, d, url, attempts=3):
                 return True
         if stop_requested():
             return False
+        # No post can load without internet, and every reopen force-stops
+        # Facebook Lite again. Fix the one cause we can fix (a USB-internet VPN
+        # with no relay behind it), then wait for the phone's connection.
+        try:
+            if stop_stale_usb_vpn(serial) and not abort_sleep(3.0):
+                return False
+        except Exception:
+            pass
+        if not wait_for_phone_internet(serial, d):
+            if stop_requested():
+                return False
+            report_error("TARGET_NOT_VERIFIED", serial, url=url,
+                         detail=f"The phone had no internet for {int(PHONE_OFFLINE_WAIT)}s, "
+                                f"so the post could not load. {last_error}".strip())
+            _save_open_failure(serial, d, url)
+            return False
         print(f"  [{serial}] not on the target post - cold reopening "
               f"({i + 1}/{attempts})")
         run(["shell", "am", "force-stop", FB_PACKAGE], serial=serial)
@@ -6109,6 +6342,7 @@ def open_target_post(serial, d, url, attempts=3):
             return False
     report_error("TARGET_NOT_VERIFIED", serial, url=url,
                  detail=f"Target verification failed after {attempts} attempts. {last_error}")
+    _save_open_failure(serial, d, url)
     return False
 
 def chooser_present(serial, d):
@@ -8928,6 +9162,12 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
 
     wake_and_unlock(serial)
     run(["shell", "svc", "power", "stayon", "true", "usb"], serial=serial)
+    # A USB-internet VPN left by a crashed or killed session keeps the phone
+    # "connected" with no way out, so no post could ever load.
+    try:
+        stop_stale_usb_vpn(serial)
+    except Exception:
+        pass
 
     results        = RunResults()
     used_accounts  = set()

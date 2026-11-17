@@ -314,6 +314,33 @@ class ManagerTests(unittest.TestCase):
             self.assertIsNone(phone.reverse)
         self.assertEqual({row["state"] for row in snap["devices"]}, {"stopped"})
 
+    def test_monitor_checks_the_vpn_on_the_phone_only_every_20s_or_after_a_repair(self):
+        tools = FakeTools([FakePhone("R58M1", installed=True)])
+        with patch.object(usb_internet.USBInternetManager, "_start_monitor"):
+            manager = self.manager(tools)
+            manager.start_all()
+
+        def phone_dumps():
+            return sum(call[3:6] == ["shell", "dumpsys", "activity"] for call in tools.calls)
+
+        before = phone_dumps()
+        clock = [5000.0]
+        with patch.object(usb_internet.time, "monotonic", side_effect=lambda: clock[0]):
+            manager._monitor_once()                       # first pass: checked
+            self.assertEqual(phone_dumps(), before + 1)
+            clock[0] += 5
+            manager._monitor_once()                       # 5 s later: tunnel only
+            self.assertEqual(phone_dumps(), before + 1)
+            clock[0] += usb_internet.VPN_RECHECK_SECONDS
+            manager._monitor_once()                       # due again
+            self.assertEqual(phone_dumps(), before + 2)
+            tools.phones["R58M1"].reverse = None           # e.g. the ADB server restarted
+            clock[0] += 1
+            manager._monitor_once()                       # restored -> checked at once
+            self.assertEqual(phone_dumps(), before + 3)
+        self.assertEqual(tools.phones["R58M1"].reverse, f"tcp:{manager.snapshot()['relay_port']}")
+        self.assertEqual(manager.snapshot()["devices"][0]["state"], "vpn_active")
+
     def test_every_event_is_persisted_as_redacted_json_lines(self):
         tools = FakeTools([FakePhone("R58M1")])
         tools.fail_install = True
