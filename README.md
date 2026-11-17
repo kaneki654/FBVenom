@@ -391,6 +391,16 @@ from an observable composer on the post. If a send was attempted but cannot be
 verified, the session reports it as unverified and does not automatically resend
 that account/link pair; inspect the post before retrying it manually.
 
+The Send control is found beside the comment field itself: the rightmost
+icon level with any part of the draft, at any screen size, keyboard up or
+down, with or without Android's button bar, and for a draft that has wrapped
+onto several lines. A cleared field showing "Comment as <name>" or "Sumulat ng
+comment..." counts as posted. When Send cannot be found
+(`COMMENT_SEND_FAILED`) or a send cannot be confirmed
+(`COMMENT_SUBMIT_UNVERIFIED`), that phone's screen is saved to the `debug`
+folder beside the app (`<serial>_comment_send_failed_<time>.png/.xml` or
+`..._comment_unverified_...`) so the exact layout can be checked.
+
 Offline regression checks (no phones, provider calls or actual comments):
 
 ```bash

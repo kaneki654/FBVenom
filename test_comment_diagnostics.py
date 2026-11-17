@@ -61,7 +61,9 @@ class CommentSubmissionTests(unittest.TestCase):
                     "run": (0, "", ""), "current_post_url": "https://www.facebook.com/live/123",
                     "report_error": None, "safe_window_size": (720, 1600),
                     "hierarchy_root": ET.fromstring("<hierarchy/>"),
-                    "edit_nodes": self.edits(self.TEXT), "visible_text": self.TEXT}
+                    "edit_nodes": self.edits(self.TEXT), "visible_text": self.TEXT,
+                    # The failure paths save the screen; no phone exists here.
+                    "dump_debug": None}
         for name, value in defaults.items():
             self.mocks[name] = self.stack.enter_context(patch.object(core, name, return_value=value))
 
@@ -95,6 +97,7 @@ class CommentSubmissionTests(unittest.TestCase):
         self.assertEqual(self.submit(), "comment-submit-unverified")
         self.mocks["run"].assert_called_once()
         self.assertEqual(self.mocks["report_error"].call_args.args[0], "COMMENT_SUBMIT_UNVERIFIED")
+        self.mocks["dump_debug"].assert_called_once_with("phone-a", self.device, "comment_unverified")
 
     def test_a_pending_draft_is_not_submitted_twice(self):
         self.assertEqual(self.submit(), "comment-submit-unverified")
@@ -136,6 +139,7 @@ class CommentSubmissionTests(unittest.TestCase):
             '<hierarchy><node content-desc="Done" bounds="[600,1300][700,1400]"/></hierarchy>')
         self.assertEqual(self.submit(), "comment-send-failed")
         self.mocks["run"].assert_not_called()
+        self.mocks["dump_debug"].assert_called_once_with("phone-a", self.device, "comment_send_failed")
 
     def test_keyboard_enter_can_submit_when_send_button_is_absent(self):
         self.mocks["find_send_button"].return_value = None

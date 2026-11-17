@@ -8181,43 +8181,98 @@ def open_comment_composer(serial, d, max_scrolls=10):
             return box
     return None
 
-def find_send_button(d):
-    width, height = safe_window_size(d)
-    box_y = None
+# A label in the comment row that rules a control out as Send, in any Facebook
+# Lite layout or language. Anything else - an unlabelled icon, or a Send icon
+# labelled in Filipino - is judged by WHERE it sits, not by what it says.
+_NOT_SEND_WORDS = ("voice", "delete", "space", "search", "done", "next",
+                   "previous", "back", "home", "overview", "recent", "camera",
+                   "photo", "picture", "gallery", "gif", "sticker", "emoji",
+                   "avatar", "profile", "like", "react", "more", "attach",
+                   "mention", "close", "cancel", "details")
+_SEND_WORDS = ("send", "post", "submit", "publish", "ipadala", "i-post", "ipost",
+               "magpadala", "i-send")
+# What an EMPTY comment field shows. Facebook Lite's Nov-2026 layout puts the
+# account's name in it ("Comment as Jie Jie") and the Taglish UI says "Sumulat
+# ng comment..." - neither matched, so a comment that HAD posted was reported
+# as unverified and counted as a failure.
+_COMPOSER_HINTS = ("write a comment", "write a public comment", "add a comment",
+                   "magsulat ng komento", "sumulat ng komento")
+_COMPOSER_HINT_PREFIXES = ("comment as ", "write a ", "add a comment",
+                           "sumulat ng ", "magsulat ng ", "mag-comment",
+                           "mag-komento", "magkomento")
+
+
+def _composer_is_placeholder(value):
+    """True when the comment field shows its empty-state hint, in any layout."""
+    value = " ".join(str(value or "").lower().split()).rstrip(" .…")
+    return value in _COMPOSER_HINTS or value.startswith(_COMPOSER_HINT_PREFIXES)
+
+
+def _composer_bounds(d):
+    """Bounds of the comment draft: the lowest editable field on screen."""
     try:
-        edits = [(bounds, attrs) for bounds, attrs in edit_nodes(d)
+        edits = [bounds for bounds, attrs in edit_nodes(d)
                  if ("EditText" in attrs.get("class", "")
                      or "AutoCompleteTextView" in attrs.get("class", "")
                      or attrs.get("editable") == "true")]
-        if edits:
-            box_y = center(max(edits, key=lambda item: item[0][1])[0])[1]
     except Exception:
-        pass
+        return None
+    return max(edits, key=lambda bounds: bounds[1]) if edits else None
 
-    send_labels = {"send", "post", "submit", "publish", "send comment", "post comment"}
 
-    def beside_composer(bounds):
+def find_send_button(d):
+    """The comment's Send control, found beside the draft it belongs to.
+
+    Measured on the fleet's own screens (FBPoison/FBVenom debug dumps; every
+    phone is 720 px wide): once text is typed, Facebook Lite shows ONE
+    clickable icon at the right end of the comment row - 68x64 at x=626 in the
+    Nov-2026 "Comment as <name>" layout, 59x56 at x=638 in the older one - with
+    a strip of quick-emoji cells (90x112) just above the row. With the keyboard
+    down on a gesture-navigation phone, that row IS the bottom of the screen,
+    so the old "ignore the bottom 100 px" rule (meant for the Back/Home bar)
+    hid Send entirely: the comment was typed and never sent, and only phones
+    with an on-screen button bar kept commenting. The row is now anchored to
+    the draft field itself: anything level with any part of it, which also
+    covers a draft that has wrapped onto several lines.
+    """
+    width, height = safe_window_size(d)
+    composer = _composer_bounds(d)
+
+    def in_row(bounds):
         x1, y1, x2, y2 = bounds
-        cx, cy = center(bounds)
-        if x1 < 0 or x2 > width or y2 > height or y1 < int(height * 0.40):
+        if x1 < 0 or x2 > width or y2 > height:
             return False
-        if cy > height - 100:
-            return False
-        # A keyboard key under the draft is not its Send button. Prefer the
-        # same horizontal band as the actual editable composer.
-        return box_y is None or abs(cy - box_y) <= max(70, int(height * 0.035))
+        cy = (y1 + y2) // 2
+        if composer is None:
+            # Nothing to anchor to: stay clear of the system navigation bar.
+            return y1 >= int(height * 0.25) and cy <= height - 100
+        margin = max(24, int(height * 0.025))
+        return composer[1] - margin <= cy <= composer[3] + margin
+
+    def says(label, words):
+        return any(word in label for word in words)
 
     candidates = []
     for bounds, attrs in clickable_items(d):
-        if not beside_composer(bounds):
+        cls = attrs.get("class", "")
+        if "EditText" in cls or "AutoCompleteTextView" in cls or bounds == composer:
+            continue                       # the draft itself, not its button
+        if not in_row(bounds):
             continue
         x1, y1, x2, y2 = bounds
         cx, cy = center(bounds)
         label = (attrs.get("content-desc") or attrs.get("text") or "").strip().lower()
-        if label in send_labels and cx > width * 0.5:
+        if label and says(label, _NOT_SEND_WORDS):
+            continue
+        if label and says(label, _SEND_WORDS) and cx > width * 0.5:
             candidates.append((9, (cx, cy)))
-        elif (not label and box_y is not None and x1 >= int(width * 0.85)
-              and 55 <= x2 - x1 <= 90 and 55 <= y2 - y1 <= 90):
+            continue
+        w, h = x2 - x1, y2 - y1
+        # Icon-sized relative to the screen, so it holds at any density.
+        iconish = (0.06 * width <= w <= 0.16 * width
+                   and 0.06 * width <= h <= 0.16 * width
+                   and 0.6 <= w / max(h, 1) <= 1.6)
+        if composer is not None and iconish and x1 >= int(width * 0.78):
             candidates.append((1 + cx / width, (cx, cy)))
     if candidates:
         candidates.sort(key=lambda candidate: -candidate[0])
@@ -8232,7 +8287,7 @@ def find_send_button(d):
             if send_btn.exists:
                 bounds = send_btn.info["bounds"]
                 rect = (bounds["left"], bounds["top"], bounds["right"], bounds["bottom"])
-                if beside_composer(rect) and center(rect)[0] > width * 0.5:
+                if in_row(rect) and center(rect)[0] > width * 0.5:
                     return center(rect)
         except Exception:
             continue
@@ -8288,6 +8343,15 @@ def type_text(serial, d, point, text):
             el = d(className="android.widget.EditText")
         el.set_text(text)
         time.sleep(0.8)
+        # set_text fills the field without a single key event. One real
+        # keystroke (a space, then deleting it) makes Facebook Lite notice the
+        # draft the way it notices typing, so its Send control follows.
+        try:
+            run(["shell", "input", "keyevent", "KEYCODE_SPACE", "KEYCODE_DEL"],
+                serial=serial)
+            time.sleep(0.3)
+        except Exception:
+            pass
         return typed in visible_text(d).lower()
 
     # `adb shell input text` is ASCII-only: an emoji either vanishes or arrives
@@ -8353,12 +8417,10 @@ def post_comment(serial, d, text):
         if typed in value:
             return "draft"
         # Android may expose the field's hint through `text` after clearing.
-        # Exact placeholder matching avoids treating arbitrary post text as
-        # an empty draft, while allowing normal English/Filipino composers.
-        placeholder = value.rstrip(" .…")
-        hints = {"write a comment", "write a public comment", "add a comment",
-                 "magsulat ng komento", "sumulat ng komento"}
-        if not value or placeholder in hints:
+        # Placeholder matching avoids treating arbitrary post text as an empty
+        # draft, while covering every composer seen on the fleet: English,
+        # Taglish ("Sumulat ng comment...") and "Comment as <account name>".
+        if not value or _composer_is_placeholder(value):
             return "empty"
         return "other"
 
@@ -8394,6 +8456,8 @@ def post_comment(serial, d, text):
                         send = point
                         break
     if send is None:
+        # Keep the screen: this failure used to leave no evidence at all.
+        dump_debug(serial, d, "comment_send_failed")
         return fail("COMMENT_SEND_FAILED", "comment-send-failed", "No usable Send or Enter control.")
     if stop_requested():
         return "stopped"
@@ -8413,6 +8477,7 @@ def post_comment(serial, d, text):
         state = composer_state()
         if state == "empty" and on_post_view(d):
             return f"commented:{text}"
+    dump_debug(serial, d, "comment_unverified")
     return fail("COMMENT_SUBMIT_UNVERIFIED", "comment-submit-unverified",
                 "The editable composer did not visibly clear on the post.")
 
