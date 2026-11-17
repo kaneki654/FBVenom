@@ -1,7 +1,8 @@
 {
-  "version": "1.1.1",
+  "version": "1.1.2",
   "url": "https://raw.githubusercontent.com/kaneki654/FBVenom/main/dist/FBVenom.exe",
-  "sha256": "af34effdae379cf3c1e3859da93004c7a61db6ae325444d0236b5a175d8bb50d",
-  "notes": "Venom interface, expanded Facebook live/link support, printable diagnostics, and Windows updater fixes.",
-  "published_at": "2026-11-15T17:14:37.110685+00:00"
+  "sha256": "2dda754731da145b1d14d7cd0c4e9f70c640ceb8b69ce98a2a3fccfc0ffa072d",
+  "notes": "LAN backup server switching, saved primary and LAN profiles, connection checks, local key loading, and responsive server switching.",
+  "size": 67260776,
+  "published": "2026-11-17T01:10:47+00:00"
 }
