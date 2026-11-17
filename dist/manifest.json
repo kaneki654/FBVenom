@@ -1,8 +1,8 @@
 {
-  "version": "1.1.3",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.3/FBVenom.exe",
-  "sha256": "b0c9a769cb2710f4b9aa2406a5498c78e41d100a56a1f706d0dbd7468873ae6f",
-  "notes": "Repairs the update channel, retries temporary server errors, improves HTTP diagnostics, and safely cancels pending update checks and downloads.",
-  "size": 67267589,
-  "published": "2026-11-17T02:39:30+00:00"
+  "version": "1.1.4",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.4/FBVenom.exe",
+  "sha256": "900f73156dd9727bb8ec0b299779550865a1d40cdc14e6af9d4f79a3315930a9",
+  "notes": "New USB internet button: share this PC's internet with every phone on a USB cable (one click, VPN prompt auto-approved, error log). Faster AI comments: written while the post opens, reused connections, and instant fallback with clear Diagnostics when the AI server is down.",
+  "size": 68272202,
+  "published": "2026-11-17T05:16:35+00:00"
 }
