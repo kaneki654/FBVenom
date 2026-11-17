@@ -2130,6 +2130,7 @@ class UpdateDialog(QDialog):
         self._cancel = threading.Event()
         self._revision = 0
         self._restart_pending = False
+        self._quit_requested = False
         self._stage_dir = os.path.abspath(updater.APP_DIR)
 
         lo = QVBoxLayout(self)
@@ -2324,7 +2325,9 @@ class UpdateDialog(QDialog):
             self._restart_timer.start(400)
 
     def _quit_after_install(self):
-        if self._restart_pending:
+        if self._restart_pending and not self._quit_requested:
+            self._quit_requested = True
+            self._restart_timer.stop()
             QApplication.quit()
 
     def _on_finished(self, *_):

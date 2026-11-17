@@ -63,6 +63,9 @@ class UpdaterDialogTests(unittest.TestCase):
     def _cleanup_dialogs(self):
         for dialog in self.dialogs:
             dialog.close()
+            # Accepted handoffs intentionally survive close in production.
+            # A mocked quit must never leave that timer for the next fixture.
+            dialog._restart_timer.stop()
         for gate in self.gates:
             gate.set()
         for thread in self.threads:
@@ -322,6 +325,21 @@ class UpdaterDialogTests(unittest.TestCase):
         self.check.assert_not_called()
         self.downgrade.assert_not_called()
         self.install.assert_called_once()
+
+    def test_restart_callback_is_idempotent_and_stops_its_timer(self):
+        self.dialog._manifest = dict(MANIFEST)
+        self.dialog.install()
+        self._wait(lambda: not self.dialog._busy)
+        self.assertTrue(self.dialog._restart_timer.isActive())
+        self.dialog._quit_after_install()
+        self.dialog._quit_after_install()
+        self.quit.assert_called_once()
+        self.assertFalse(self.dialog._restart_timer.isActive())
+        self.assertTrue(self.dialog._restart_pending)
+        self.dialog.check()
+        self.dialog.install()
+        self.install.assert_called_once()
+        self.check.assert_not_called()
 
     def test_rollback_requires_confirmation_and_uses_guarded_restart(self):
         with patch.object(gui.QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
