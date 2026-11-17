@@ -351,5 +351,69 @@ class PrefetchTests(unittest.TestCase):
         self.assertIsNone(core.take_prefetched_comment("https://a", "x"))
 
 
+class RetryFeedbackTests(_Base):
+    """A rejected styled attempt tells the next one which words sank it."""
+
+    EXAMPLES = ["grabe ang ganda ng view dito sana makabalik ulit kami",
+                "sobrang sulit ng bakasyon namin"]
+    LEANING = "view dito kinilig ako sana makabalik din kami"
+    CLEAN = "ang saya ng tanawin gusto ko pumunta dyan"
+
+    def setUp(self):
+        super().setUp()
+        core.set_current_post_url("https://www.facebook.com/reel/feedback-test")
+        self.addCleanup(core.set_current_post_url, None)
+
+    def test_gate_names_the_echoed_words_in_typed_order_without_changing_the_verdict(self):
+        ctx = " ".join(self.EXAMPLES)
+        feedback = {}
+        self.assertFalse(core._good_context_comment(self.LEANING, self.EXAMPLES, ctx, feedback=feedback))
+        self.assertEqual(feedback["avoid"], ["view", "sana", "makabalik"])
+        self.assertFalse(core._good_context_comment(self.LEANING, self.EXAMPLES, ctx))
+        self.assertTrue(core._good_context_comment(self.CLEAN, self.EXAMPLES, ctx, feedback={}))
+
+    def test_words_used_up_under_the_post_are_named_too(self):
+        feedback = {}
+        with patch.object(core, "_spent_words", return_value={"tanawin"}):
+            self.assertFalse(core._good_context_comment(
+                self.CLEAN, self.EXAMPLES, " ".join(self.EXAMPLES), feedback=feedback))
+        self.assertEqual(feedback["avoid"], ["tanawin"])
+
+    def test_styled_gate_names_a_name_that_is_not_in_the_post(self):
+        feedback = {}
+        with patch.object(core, "_foreign_entity", return_value="Batman"):
+            self.assertFalse(core._good_styled_comment(
+                "grabe si batman dito", "grabe si batman dito".split(), {"length": "any"},
+                "a post about a beach", self.EXAMPLES, feedback=feedback))
+        self.assertEqual(feedback["avoid"], ["batman"])
+
+    def test_avoid_line_is_empty_until_something_was_rejected_and_stays_bounded(self):
+        self.assertEqual(core._retry_avoid_line([]), "")
+        line = core._retry_avoid_line(["a", "b", "a"] + [f"w{i}" for i in range(20)])
+        self.assertIn('"a", "b", "w0"', line)
+        self.assertEqual(line.count('"'), 20)          # ten words, deduplicated
+        self.assertIn("NONE of them", line)
+
+    def test_retry_prompt_names_every_word_rejected_so_far(self):
+        prompts = []
+        replies = [self.LEANING, "sobrang sulit grabe talaga", self.CLEAN]
+
+        def chat(prompt_text, *args, **kwargs):
+            prompts.append(prompt_text)
+            return replies[len(prompts) - 1]
+        with patch.object(core, "_groq_chat", side_effect=chat), \
+                patch.object(core, "sanitize_comment", side_effect=lambda raw, *a, **k: raw):
+            out = core._generate_context_comment(self.EXAMPLES, " ".join(self.EXAMPLES),
+                                                 retries=3, tone="neutral")
+        self.assertEqual(out, self.CLEAN)
+        self.assertEqual(len(prompts), 3)
+        self.assertNotIn("YOUR LAST TRY WAS REJECTED", prompts[0])
+        self.assertIn('reusing these words: "view", "sana", "makabalik"', prompts[1])
+        # The list only grows: attempt 3 still hears attempt 1's words.
+        self.assertIn('"view", "sana", "makabalik", "sobrang", "sulit", "grabe"', prompts[2])
+        for prompt in prompts:
+            self.assertTrue(prompt.startswith(prompts[0][:200]))
+
+
 if __name__ == "__main__":
     unittest.main()

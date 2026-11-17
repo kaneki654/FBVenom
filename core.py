@@ -2858,7 +2858,7 @@ _STYLE_LEAK = (" register ", " caps ", " all caps ", " comparison ",
                " code-switch ", " punctuation ")
 
 
-def _good_styled_comment(out, words, style, ctx="", examples=()):
+def _good_styled_comment(out, words, style, ctx="", examples=(), feedback=None):
     """Gate for a sampled sarcastic-anger comment.
 
     Checks what the style actually promised: the length band it drew, the
@@ -2899,6 +2899,8 @@ def _good_styled_comment(out, words, style, ctx="", examples=()):
     if stray:
         print(f"  [ai] rejected (brings in '{stray}' - not in the post or the "
               f"examples): {out[:60]}")
+        if feedback is not None:
+            feedback.setdefault("avoid", []).append(str(stray).lower())
         return False
     # Talking about a profile photo is only wrong when the POST is not about
     # one. Plenty of posts are exactly that ("new pfp"), and rejecting those
@@ -2913,6 +2915,8 @@ def _good_styled_comment(out, words, style, ctx="", examples=()):
     if hit:
         print(f"  [ai] rejected (hard swearing '{hit.group(0)}' - gets the "
               f"comment pulled): {out[:60]}")
+        if feedback is not None:
+            feedback.setdefault("avoid", []).append(hit.group(0).lower())
         return False
     for meta in _STYLE_LEAK:
         if meta in low:
@@ -2947,8 +2951,42 @@ def comment_system_context(examples, tone=None, style=None):
             + tone_block(tone) + _CTX_SYSTEM_TAIL)
 
 
-def _good_context_comment(out, examples, ctx, style=None):
+def _note_avoid(feedback, out, keys):
+    """Record which of `out`'s words got it rejected, for the next attempt.
+
+    `keys` are capped forms (_word_key); the surface words the model actually
+    typed are what it needs to hear back, in the order it used them.
+    """
+    if feedback is None or not keys:
+        return
+    typed = [w for w in re.findall(r"[a-z0-9]+", str(out or "").lower())
+             if _word_key(w) in keys]
+    feedback.setdefault("avoid", []).extend(dict.fromkeys(typed or sorted(keys)))
+
+
+def _retry_avoid_line(words):
+    """Tell a retry exactly which words got the last attempt(s) rejected.
+
+    The retry used to resend the identical prompt, so the model mostly made
+    the identical choice: measured through the live endpoint on a two-example
+    post, all three styled attempts leaned on "sana"/"view"/"makabalik" and the
+    comment fell through to the plain reword path, ~4s of wasted calls each.
+    """
+    words = [w for w in dict.fromkeys(words) if w][:10]
+    if not words:
+        return ""
+    return ("\n\nYOUR LAST TRY WAS REJECTED for reusing these words: "
+            + ", ".join(f'"{w}"' for w in words)
+            + ". Write a different comment that contains NONE of them - not "
+              "even another form of them. Reply with only the comment.")
+
+
+def _good_context_comment(out, examples, ctx, style=None, feedback=None):
     """Quality gate for a context comment.
+
+    `feedback`, when given, collects the words a rejection was about under
+    "avoid", so the next attempt can be told to steer clear of them. The
+    verdict itself does not depend on it.
 
     _good_variation is the wrong test here - it rejects anything that does not
     mean what the example means, and meaning something NEW about the post is the
@@ -2970,7 +3008,7 @@ def _good_context_comment(out, examples, ctx, style=None):
         return False
     joined = " ".join(examples)
     if style:
-        return _good_styled_comment(out, words, style, ctx, examples)
+        return _good_styled_comment(out, words, style, ctx, examples, feedback=feedback)
     # _detect_lang is a marker-word count, and gamer slang is not in its list:
     # of "angas ng sukuna wallpaper" / "angas bangis tol" / "sheeesh iba talaga
     # tol kapg sukuna", it calls the last two ENGLISH. At comment length it is
@@ -3011,6 +3049,7 @@ def _good_context_comment(out, examples, ctx, style=None):
     if len(echoed) > 1:
         print(f"  [ai] rejected (leans on the example's words "
               f"{sorted(echoed)}): {out[:60]}")
+        _note_avoid(feedback, out, echoed)
         return False
     # A word that has had its allowance under this post is retired. This is
     # what actually stops one word riding into every comment.
@@ -3018,6 +3057,7 @@ def _good_context_comment(out, examples, ctx, style=None):
     if burnt:
         print(f"  [ai] rejected (word already used {WORD_USE_LIMIT}x under "
               f"this post: {sorted(burnt)}): {out[:60]}")
+        _note_avoid(feedback, out, burnt)
         return False
     if voice and not (out_content - voice):
         print(f"  [ai] rejected (says nothing the examples did not - it is "
@@ -3369,6 +3409,10 @@ def _generate_context_comment(examples, ctx, retries=3, avoid_openings=None,
         + " Reply with only the comment, and nothing else."
     )
     max_tok = max(60, min(400, target * 6 + 60))
+    # Words earlier attempts were rejected for, in the order they came up.
+    # Each retry is told them by name, and the list only grows, so attempt 3
+    # cannot walk back into what sank attempt 1.
+    rejected_words = []
     for attempt in range(retries):
         # Checked before taking a pacing slot: a phone must not queue behind
         # the fleet only to learn the endpoint is resting.
@@ -3377,12 +3421,17 @@ def _generate_context_comment(examples, ctx, retries=3, avoid_openings=None,
         if not _ai_wait_slot():
             return ""
         try:
-            raw = _groq_chat(prompt_text, system=system_prompt,
-                             max_tokens=max_tok, cfg=cfg)
+            raw = _groq_chat(prompt_text + _retry_avoid_line(rejected_words),
+                             system=system_prompt, max_tokens=max_tok, cfg=cfg)
             out = sanitize_comment(raw, "", style=style)
-            if _good_context_comment(out, examples, ctx, style=style):
+            feedback = {}
+            if _good_context_comment(out, examples, ctx, style=style,
+                                     feedback=feedback):
                 _claim_phrases(out)
                 return out
+            for word in feedback.get("avoid", ()):
+                if word not in rejected_words:
+                    rejected_words.append(word)
             continue
         except Exception as e:
             print(f"  [ai] context attempt {attempt+1} failed: {e}")
