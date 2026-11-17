@@ -1,8 +1,8 @@
 {
-  "version": "1.1.6",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.6/FBVenom.exe",
-  "sha256": "0eca454a3b7043f28c5db5a31f48f0bf919caa11369aad9bbe5d5b0b34ee0cdc",
-  "notes": "Fixes comments that were typed but never sent: Send is now found on every phone (gesture navigation, keyboard up or down, long comments), and posts in the new 'Comment as <name>' and Taglish layouts are counted correctly. Failed sends now save the screen to the debug folder.",
-  "size": 68276040,
-  "published": "2026-11-17T07:08:09+00:00"
+  "version": "1.1.7",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.7/FBVenom.exe",
+  "sha256": "02dfee98804681cb3d9519991e3c9126be39e8f77c04c85d84e8c21fc4a86de9",
+  "notes": "Fixes phones that could not open posts: links containing '&' now reach Facebook Lite whole, slow connections get time to load instead of Facebook Lite being closed and restarted, phones with no internet are reported and waited for, and a leftover USB internet VPN is switched off automatically. Rescans no longer restart ADB for unauthorized phones or while USB internet is on. Posts that still will not open save the screen to the debug folder.",
+  "size": 68279396,
+  "published": "2026-11-17T14:48:40+00:00"
 }
