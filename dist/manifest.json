@@ -1,8 +1,8 @@
 {
-  "version": "1.1.7",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.7/FBVenom.exe",
-  "sha256": "02dfee98804681cb3d9519991e3c9126be39e8f77c04c85d84e8c21fc4a86de9",
-  "notes": "Fixes phones that could not open posts: links containing '&' now reach Facebook Lite whole, slow connections get time to load instead of Facebook Lite being closed and restarted, phones with no internet are reported and waited for, and a leftover USB internet VPN is switched off automatically. Rescans no longer restart ADB for unauthorized phones or while USB internet is on. Posts that still will not open save the screen to the debug folder.",
-  "size": 68279396,
-  "published": "2026-11-17T14:48:40+00:00"
+  "version": "1.1.8",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.8/FBVenom.exe",
+  "sha256": "33c5663fed8a4dc16e8d55617333b9ea659246b7d70e33f17e37a30751151696",
+  "notes": "Comments on share/v, share/r, watch and every video link (they open in the reel player); safer reel commenting; window stays scrollable and responsive during sessions",
+  "size": 68288193,
+  "published": "2026-11-18T03:50:09+00:00"
 }
