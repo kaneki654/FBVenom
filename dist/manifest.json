@@ -1,8 +1,8 @@
 {
-  "version": "1.1.8",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.8/FBVenom.exe",
-  "sha256": "33c5663fed8a4dc16e8d55617333b9ea659246b7d70e33f17e37a30751151696",
-  "notes": "Comments on share/v, share/r, watch and every video link (they open in the reel player); safer reel commenting; window stays scrollable and responsive during sessions",
-  "size": 68288193,
-  "published": "2026-11-18T03:50:09+00:00"
+  "version": "1.1.9",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.9/FBVenom.exe",
+  "sha256": "2edd10f8fdc2f785f7781f42f3b13b86adc32c95ee3bd7f155deac33e98d7cb5",
+  "notes": "Share/v, share/r and video links open first time with a fresh start (no more reopening from the previous reel); comments on every reel and video link",
+  "size": 68287465,
+  "published": "2026-11-18T06:16:37+00:00"
 }
