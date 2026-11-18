@@ -22,10 +22,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
     QSizePolicy, QButtonGroup, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
     QCheckBox, QDialog, QTabBar, QSpinBox, QMessageBox, QPlainTextEdit)
 from PyQt6.QtCore import (Qt, QTimer, QPropertyAnimation, QEasingCurve,
-    QRect, QRectF, QPointF, QSize, QVariantAnimation, QPoint, QUrl)
+    QRect, QRectF, QPointF, QSize, QVariantAnimation, QPoint, QUrl, QObject, QEvent)
 from PyQt6.QtGui import (QPainter, QColor, QBrush, QPen, QFont, QFontDatabase,
     QPainterPath, QPolygonF, QPixmap, QIcon, QLinearGradient, QRadialGradient,
-    QCursor, QDesktopServices)
+    QCursor, QDesktopServices, QTextCursor)
 
 # Import core functions from fb_core
 import core as fbcore
@@ -1278,10 +1278,18 @@ class DeviceCard(QFrame):
     def play_in(self, delay=0):
         QTimer.singleShot(delay, self._anim.start)
 
+    # The "processing" pulse is decorative. Redrawing every phone's card 30
+    # times a second was a large share of the window's time with a big fleet;
+    # ~8 redraws a second still reads as a smooth pulse.
+    PULSE_REDRAW = 0.12
+
     def advance(self, dt):
         if self.status == 'processing':
             self.t += dt
-            self.update()
+            self._since_paint = getattr(self, "_since_paint", 0.0) + dt
+            if self._since_paint >= self.PULSE_REDRAW:
+                self._since_paint = 0.0
+                self.update()
 
     def set_status(self, status, detail=""):
         self.status = status
@@ -3044,6 +3052,10 @@ class ReactionGUI(QMainWindow):
             "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0}"
             "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent}")
         self.dev_list.setAccessibleName("Connected devices")
+        # During a session the list stays scrollable; only its selection is frozen.
+        self._device_list_guard = _ViewOnlyFilter(self.dev_list)
+        self.dev_list.viewport().installEventFilter(self._device_list_guard)
+        self.dev_list.installEventFilter(self._device_list_guard)
         self.dev_list.setMouseTracking(True)
         self.dev_list.viewport().setMouseTracking(True)
         self.dev_list.itemEntered.connect(self.on_device_hover)
@@ -3193,8 +3205,13 @@ class ReactionGUI(QMainWindow):
         self.session_options_btn.setText("Session options  ▾" if expanded else "Session options  ▸")
         self.update_briefing()
 
+    # How many diagnostics the panel keeps. Each one is appended and the oldest
+    # trimmed in constant time - see _append_diagnostic.
+    DIAGNOSTIC_LIMIT = 500
+
     def _build_diagnostics(self, root):
         self._diagnostic_events = []
+        self._diagnostic_blocks = []      # text lines each event occupies in the view
         self._diagnostic_errors = 0
         self._diagnostic_warnings = 0
         self.diagnostics = QFrame()
@@ -3228,7 +3245,9 @@ class ReactionGUI(QMainWindow):
         self.diagnostics_log.setAccessibleName("Session diagnostics log")
         self.diagnostics_log.setReadOnly(True)
         self.diagnostics_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        self.diagnostics_log.document().setMaximumBlockCount(4000)
+        # _append_diagnostic keeps the view to DIAGNOSTIC_LIMIT events itself;
+        # this is only a backstop far above what 500 events can occupy.
+        self.diagnostics_log.document().setMaximumBlockCount(20000)
         self.diagnostics_log.setFixedHeight(138)
         self.diagnostics_log.setStyleSheet(
             f"QPlainTextEdit{{background:{C_INPUT};color:{C_MUTE};border:1px solid {C_BORDER};"
@@ -3275,22 +3294,41 @@ class ReactionGUI(QMainWindow):
             lines.append("Target: " + str(event["url"]))
         return "\n".join(lines)
 
+    def _count_diagnostic(self, event, step):
+        # A missing severity is an error; "info" notices (AI recovered, phone
+        # online) are shown, not counted.
+        if event.get("severity", "error") == "error":
+            self._diagnostic_errors += step
+        elif event.get("severity") not in ("info", None):
+            self._diagnostic_warnings += step
+
     def _append_diagnostic(self, event):
+        """Show one diagnostic, in constant time however long the session runs.
+
+        Once 500 were kept, every new one used to rebuild the WHOLE log
+        (setPlainText of all 500, plus recounting them) on the window's own
+        thread. A busy fleet reports several a second, so after a few minutes
+        that was most of the window's time - measured with 30 simulated phones,
+        412 rebuilds in 10 s - and on a slower PC the window stopped answering
+        clicks and scrolling for the rest of the session. Now the new text is
+        appended and only the oldest event's own lines are cut from the top,
+        so the view and Copy log still agree.
+        """
         event = dict(event)
+        text = self._diagnostic_text(event)
         self._diagnostic_events.append(event)
-        if len(self._diagnostic_events) > 500:
-            self._diagnostic_events.pop(0)
-        self._diagnostic_errors = sum(e.get("severity", "error") == "error"
-                                      for e in self._diagnostic_events)
-        # "info" notices (AI recovered, phone online) are shown, not counted.
-        self._diagnostic_warnings = sum(e.get("severity") not in ("error", "info", None)
-                                        for e in self._diagnostic_events)
-        # Rebuild only at the bound so the plain-text view and Copy log agree.
-        if len(self._diagnostic_events) == 500:
-            self.diagnostics_log.setPlainText("\n\n".join(
-                self._diagnostic_text(e) for e in self._diagnostic_events))
-        else:
-            self.diagnostics_log.appendPlainText(self._diagnostic_text(event) + "\n")
+        # appendPlainText(text + "\n") occupies the text's lines plus one blank.
+        self._diagnostic_blocks.append(text.count("\n") + 2)
+        self._count_diagnostic(event, +1)
+        while len(self._diagnostic_events) > self.DIAGNOSTIC_LIMIT:
+            self._count_diagnostic(self._diagnostic_events.pop(0), -1)
+            blocks = self._diagnostic_blocks.pop(0)
+            cursor = QTextCursor(self.diagnostics_log.document())
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.movePosition(QTextCursor.MoveOperation.NextBlock,
+                                QTextCursor.MoveMode.KeepAnchor, blocks)
+            cursor.removeSelectedText()
+        self.diagnostics_log.appendPlainText(text + "\n")
         self._refresh_diagnostics_label()
         self.diagnostics_hint.setText(str(event.get("message") or event.get("code", "")))
         self.diagnostics_hint.setToolTip(self.diagnostics_hint.text())
@@ -3302,6 +3340,7 @@ class ReactionGUI(QMainWindow):
 
     def _clear_diagnostics(self):
         self._diagnostic_events.clear()
+        self._diagnostic_blocks.clear()
         self._diagnostic_errors = self._diagnostic_warnings = 0
         self.diagnostics_log.clear()
         self.diagnostics_hint.setText("Errors stay here after the session.")
@@ -3636,8 +3675,20 @@ class ReactionGUI(QMainWindow):
         self.new_workspace_btn.setEnabled(not self._workspace_load_error)
         self.edit_workspace_btn.setEnabled(bool(self.current_workspace_id))
         self.delete_workspace_btn.setEnabled(bool(self.current_workspace_id))
-        self.cfg_panel.setEnabled(idle and configured)
-        self.devices_panel.setEnabled(idle)
+        # The link list and the device list stay scrollable and readable while a
+        # session runs. Disabling the whole panels is what made the window feel
+        # frozen - a disabled panel will not even scroll - so only what the
+        # running session depends on is locked.
+        self.cfg_panel.setEnabled(configured)
+        for row in self.link_rows:
+            row.set_locked(not idle)
+        self.add_link_btn.setEnabled(idle)
+        self.devices_panel.setEnabled(True)
+        self._device_list_guard.active = not idle
+        self.all_btn.setEnabled(idle)
+        self.refresh_btn.setEnabled(idle)
+        for pill in self.device_pills.values():
+            pill.setEnabled(idle)
         self.dose_rate.setEnabled(idle and configured)
         self.screenshot_check.setEnabled(idle and configured)
         self.ai_btn.setEnabled(idle)
@@ -3922,14 +3973,57 @@ class ReactionGUI(QMainWindow):
         except OSError:
             pass
 
+    # Display updates that only ever show the LATEST value: a burst of them
+    # collapses to its last one. Everything else is handled in arrival order.
+    _LATEST_ONLY = frozenset({"status", "msg", "progress", "stats"})
+    # Window time one tick may spend on worker messages (the tick is 100 ms).
+    QUEUE_BUDGET = 0.040
+
     def process_queue(self):
-        while not self.output_queue.empty():
+        """Show what the phone workers reported, without starving the window.
+
+        This used to run until the queue was empty, so a fleet reporting faster
+        than the window could draw kept it here and every click and scroll
+        waited. Each tick now has a time budget; repeated "latest value"
+        updates collapse to one; anything left waits for the next tick.
+        """
+        deadline = time.perf_counter() + self.QUEUE_BUDGET
+        pending = {}
+
+        def flush():
+            for message in pending.values():
+                self._handle_safely(message)
+            pending.clear()
+
+        while time.perf_counter() < deadline:
             try:
                 msg = self.output_queue.get_nowait()
-                if isinstance(msg, dict):
-                    self.handle_cmd(msg)
             except queue.Empty:
                 break
+            if not isinstance(msg, dict):
+                continue
+            action = msg.get("action")
+            if action in self._LATEST_ONLY:
+                key = action
+            elif action == "device_progress":
+                key = (action, msg.get("serial"))
+            else:
+                key = None
+            if key is not None:
+                pending.pop(key, None)       # keep the latest, in its new place
+                pending[key] = msg
+                continue
+            flush()                          # order kept around everything else
+            self._handle_safely(msg)
+        flush()
+
+    def _handle_safely(self, msg):
+        # One bad message must not leave the rest of the queue unshown.
+        try:
+            self.handle_cmd(msg)
+        except Exception as exc:
+            print(f"[ui] could not show {msg.get('action')!r}: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
 
     def handle_cmd(self, cmd):
         a = cmd.get("action")
@@ -4278,6 +4372,8 @@ class ReactionGUI(QMainWindow):
         return row
 
     def remove_link_row(self, row):
+        if self.running:
+            return              # the running session was started with this link
         if len(self.link_rows) <= 1:
             self.send_cmd({"action": "toast", "text": "At least one link is required"})
             return
@@ -4959,6 +5055,21 @@ class CommentPill(QPushButton):
         p.end()
 
 
+class _ViewOnlyFilter(QObject):
+    """While active, a list still scrolls (wheel, scrollbar) and shows its
+    tooltips, but clicks and keys that would change its selection are ignored."""
+
+    BLOCKED = frozenset({QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+                         QEvent.Type.MouseButtonDblClick, QEvent.Type.KeyPress})
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.active = False
+
+    def eventFilter(self, obj, event):
+        return bool(self.active and event.type() in self.BLOCKED)
+
+
 class LinkRow(QFrame):
     """One target: <link> <reaction> <example comment>."""
 
@@ -5067,6 +5178,15 @@ class LinkRow(QFrame):
         self.reaction.setVisible(show_reaction)
         self.comment.setVisible(show_comment)
         self._comment_label.setVisible(show_comment)
+
+    def set_locked(self, locked):
+        """Read-only while a session runs: still readable, selectable and
+        copyable, and the list around it still scrolls - only what the running
+        session was started with cannot change."""
+        self.url.setReadOnly(locked)
+        self.comment.setReadOnly(locked)
+        self.reaction.setEnabled(not locked)
+        self.kill.setEnabled(not locked)
 
     def target(self):
         return {"url": self.url.text().strip(),

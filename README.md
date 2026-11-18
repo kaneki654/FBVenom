@@ -24,6 +24,16 @@ symbiote header, dedicated link workspace, device controls and session activity.
 The **Diagnostics** panel shows actionable errors during a session; use **Copy**
 to share the displayed report or **Clear** to reset the panel.
 
+The window stays usable while a session runs. The link list and the device list
+scroll and can be read and copied. Only what the running session was started
+with is locked: link text, Add/Remove link, device selection and comment
+toggles, workspaces, tabs and AI settings. **Stop session**, Diagnostics,
+Session activity and the screenshots folder all work. Before 1.1.8 those panels
+were disabled outright, so they would not even scroll. The window's own thread
+was also kept busy: past 500 diagnostics, each new one rebuilt the whole log.
+Measured with 30 simulated phones, the window was 25% busy before and 7% after,
+and a click waited at most 6 ms instead of 83 ms (60 phones: 291 ms → 23 ms).
+
 ## Running
 
 Local AI settings, saved workspaces, logs and build intermediates are ignored by Git. Configure AI from **AI SETTINGS**, or copy `venom_ai.example.json` to `venom_ai.json` and add your key locally. The verified Windows executable and its checksum/build metadata are versioned in `dist/`.
@@ -355,11 +365,13 @@ the only place it is decided.
 
 Every target is normalized once in the background before phone workers start,
 so the entire fleet receives the same URL. The input may be a clean link or a
-Facebook/Messenger sentence containing one. Mobile, `mbasic`, `web`, `touch`
-and other Facebook hosts become `https://www.facebook.com`; tracking parameters
-such as `mibextid`, `fbclid`, `ref`, `utm_*`, `__cft__` and `__tn__` are removed;
-Facebook `l.php`/`share.php` wrappers are unwrapped; `/amp` and fragments are
-removed. Non-Facebook URLs are rejected.
+Facebook/Messenger sentence containing one. Mobile, `mbasic`, `web`, `touch`,
+mistyped (`ww.facebook.com`) and other Facebook hosts, and Facebook's own
+`fb.com` alias (it answers 301 to the same path on www.facebook.com), become
+`https://www.facebook.com`; tracking parameters such as `mibextid`, `fbclid`,
+`ref`, `utm_*`, `__cft__`, `__tn__` and the `rdid`/`share_url`/`wtsid` that
+Facebook's own redirects add are removed; Facebook `l.php`/`share.php` wrappers
+are unwrapped; `/amp` and fragments are removed. Non-Facebook URLs are rejected.
 
 Supported target forms include `/live/<id>`, page `/live/<id>` and
 `/live_videos/<id>`, `/watch/live?v=<id>`, ordinary videos, reels, photo
@@ -369,8 +381,13 @@ receive web fallbacks when their content ID is recognized. Facebook sharer and
 `facewebmodal` wrappers are unwrapped without discarding the content ID.
 
 Opaque `/share/p`, `/share/r`, `/share/v`, `fb.watch` and `fb.me` links are
-resolved once on the PC when Facebook exposes a canonical destination. If it
-does not, the cleaned share link remains the safe fallback.
+resolved once on the PC when Facebook exposes a canonical destination. Share
+links answer with **no redirect**: the post's address is in the page's
+`<link rel="canonical">`, read as a phone browser would. When that answer names
+no post (a login or consent page, a rate limit, a network blip), Facebook's
+link-preview crawler is asked as well; it is redirected straight to the
+content. If neither works, the cleaned share link remains the fallback, and
+Facebook Lite resolves it on the phone.
 `fb.gg` gaming links are also resolved, and each phone gets an ordered,
 deduplicated opener list appropriate to numeric posts, pfbid
 posts, group posts, photos, videos and reels: native deep links where reliable,
@@ -383,7 +400,39 @@ content, or enable comments where Facebook has disabled them. Profiles, feeds
 and content collections do not identify a single comment target. If a short
 link cannot be resolved, its cleaned original is retained and a warning explains
 the fallback. A failed resolution is retried after five minutes instead of
-being remembered until the app restarts.
+being remembered until the app restarts. A link that names no single post
+(a profile, a page, a group's front page) is flagged before the run
+(`LINK_NOT_SINGLE_CONTENT`) but still tried. Story links are skipped
+(`LINK_NOT_COMMENTABLE`): a story's only box is a private Messenger reply,
+and typing into it would send a message, not a comment.
+
+### What each link shows, and where its comment box is
+
+| Link | Facebook Lite shows | The comment box |
+|---|---|---|
+| `/reel/<id>`, `/share/r/…` | the reel player | behind **Comment**, the 2nd button of the rail down the right edge (Like, Comment, Share, More); it opens a sheet with the box at the bottom |
+| `/share/v/…`, `/watch?v=<id>`, `/<page>/videos/<id>`, `/live/<id>`, `fb.watch`, `fb.gg` | the reel player too | the same rail button |
+| posts, `/share/p/…`, `story.php`, `permalink.php`, group posts, photos | the post view | at the bottom of the post, or behind its Comment button |
+
+Facebook serves every video as a reel on a phone. Measured on facebook.com on
+2026-11-18: `/watch/?v=X`, `/<page>/videos/X` and a 1920x1080 `/share/v/` link all
+name `https://www.facebook.com/reel/X` as their page for an Android browser,
+and one numeric ID names the reel, the video page and the watch page. So a video
+link also gets `/reel/<id>` and `fb://reel/<id>` openers, and the reel player
+counts as "on the target" for it. Before 1.1.8 only `/reel/` and `/share/r/`
+links did. A `/share/v/` link that opened in the reel player was refused as "not
+the target post", because the reel's author row looks like a post's action row,
+and so it was never commented. The fleet's own saved screens show exactly that
+refusal 19 times.
+
+On a reel or video the run never swipes: a vertical swipe in the reel player is
+**next reel**, and the old post-style "scroll down to the comment box" step
+could walk away from the target. If the comment sheet is slow, Comment is
+pressed again (twice at most), and if it still never opens, the screen is saved
+to `debug/<serial>_reel_comment_box_missing_<time>.png/.xml`. A reel's comment
+sheet is recognized with the keyboard up, too, so a comment posted there is
+counted. A comment's Like buttons down the side of the sheet are never mistaken
+for the rail.
 
 ### Opening the post on the phone
 
@@ -417,6 +466,7 @@ details are redacted.
 
 Examples include `DEVICE_UNAUTHORIZED`, `ADB_TIMEOUT`, `TARGET_OPEN_FAILED`,
 `TARGET_NOT_VERIFIED`, `PHONE_NO_INTERNET`, `USB_VPN_STALE_STOPPED`,
+`SHARE_UNRESOLVED`, `LINK_NOT_SINGLE_CONTENT`, `LINK_NOT_COMMENTABLE`,
 `COMMENT_NO_BOX`, `COMMENT_NOT_TYPED`, `ACTION_BLOCKED` and
 `COMMENT_SUBMIT_UNVERIFIED`. A comment is confirmed only after its draft clears
 from an observable composer on the post. If a send was attempted but cannot be

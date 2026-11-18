@@ -333,7 +333,9 @@ class ShareLinkResolutionTests(unittest.TestCase):
                 with mock.patch.object(core, "report_error") as error:
                     self.assertEqual(core.normalize_phone_url(self.SHARE), self.SHARE)
                     self.assertEqual(core.normalize_phone_url(self.SHARE), self.SHARE)
-            self.assertEqual(fetch.call_count, 1)
+            # One lookup = the phone-browser fetch plus the crawler fallback;
+            # the second call is answered from the cache.
+            self.assertEqual(fetch.call_count, 2)
             error.assert_called_once()
             self.assertEqual(error.call_args.args[0], "SHARE_UNRESOLVED")
             self.assertEqual(error.call_args.kwargs["severity"], "warning")
@@ -391,6 +393,162 @@ class TargetOpeningDiagnosticsTests(unittest.TestCase):
                 mock.patch.object(core, "run") as adb:
             self.assertFalse(core.open_post("phone", "https://www.facebook.com/live/123"))
         adb.assert_not_called()
+
+
+class EveryLinkFormTests(unittest.TestCase):
+    """Every way a Facebook link arrives, and what the phone will show for it.
+
+    The live answers below were recorded from facebook.com on 2026-11-18 for
+    public videos: an Android browser gets the canonical page in <head> with
+    NO redirect, Facebook's link-preview crawler gets a redirect, and the same
+    numeric ID names the reel, the video page and the watch page.
+    """
+
+    REEL_ID = "1389919633103002"         # /share/r/1DTPaZadbE
+    VIDEO_ID = "1945917729708319"        # /share/v/19zVwRPKRW, a 1920x1080 video
+
+    def tearDown(self):
+        core._url_resolve_cache.clear()
+        core._url_resolve_failed_at.clear()
+
+    def test_share_links_in_every_shape_people_paste(self):
+        cases = (
+            ("https://ww.facebook.com/share/v/19zVwRPKRW/?mibextid=wwXIfr",
+             "https://www.facebook.com/share/v/19zVwRPKRW"),
+            ("facebook.com/share/r/1DTPaZadbE/",
+             "https://www.facebook.com/share/r/1DTPaZadbE"),
+            ("https://m.facebook.com/share/v/19zVwRPKRW/",
+             "https://www.facebook.com/share/v/19zVwRPKRW"),
+            ("https://web.facebook.com/share/r/1DTPaZadbE/?rdid=x&share_url=y",
+             "https://www.facebook.com/share/r/1DTPaZadbE"),
+            ("Panoorin: https://www.facebook.com/share/v/19zVwRPKRW/ salamat!",
+             "https://www.facebook.com/share/v/19zVwRPKRW"),
+            # fb.com answers 301 to the same path on www.facebook.com.
+            ("https://fb.com/reel/1389919633103002",
+             "https://www.facebook.com/reel/1389919633103002"),
+            ("https://www.fb.com/share/r/1DTPaZadbE/",
+             "https://www.facebook.com/share/r/1DTPaZadbE"),
+            ("check this fb.com/reel/42 now", "https://www.facebook.com/reel/42"),
+            # What Facebook's own redirects append.
+            ("https://www.facebook.com/somepage/videos/1945917729708319/"
+             "?extid=reels&wtsid=rdr_0w3V&refsrc=deprecated&_rdr",
+             "https://www.facebook.com/somepage/videos/1945917729708319"),
+            ("https://notfb.com/reel/1", ""),
+            ("https://fb.com.evil.example/reel/1", ""),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(core.normalize_url(raw), expected)
+
+    def test_what_every_link_shows_on_the_phone(self):
+        cases = (
+            ("https://www.facebook.com/share/r/1DTPaZadbE", "reel"),
+            ("https://www.facebook.com/share/v/19zVwRPKRW", "video"),
+            ("https://www.facebook.com/share/p/19wgP63C6r", "post"),
+            ("https://www.facebook.com/reel/1389919633103002", "reel"),
+            ("https://www.facebook.com/watch/?v=1945917729708319", "video"),
+            ("https://www.facebook.com/somepage/videos/141169-live/1945917729708319/", "video"),
+            ("https://www.facebook.com/gamer/live/123", "video"),
+            ("https://fb.watch/AbCd12/", "video"),
+            ("https://fb.gg/somegamer", "video"),
+            ("fb://reel/1389919633103002", "reel"),
+            ("https://www.facebook.com/RadyoPilipinas/posts/some-title/1234567890", "post"),
+            ("https://m.facebook.com/story.php?story_fbid=123&id=456", "post"),
+            ("https://www.facebook.com/groups/111/posts/222/", "post"),
+            ("https://www.facebook.com/photo.php?fbid=999", "photo"),
+            ("https://www.facebook.com/zuck", None),
+        )
+        for url, kind in cases:
+            with self.subTest(url=url):
+                self.assertEqual(core._target_kind(url), kind)
+                core.set_current_post_url(url)
+                self.assertEqual(core._is_reel_context(), kind in ("reel", "video"))
+        core.set_current_post_url(None)
+
+    def test_a_video_link_also_gets_its_reel_openers(self):
+        variants = core._fb_uri_variants(
+            "https://www.facebook.com/watch/?v=" + self.VIDEO_ID)
+        self.assertEqual(variants[:3], [
+            "https://www.facebook.com/watch?v=" + self.VIDEO_ID,
+            "https://www.facebook.com/reel/" + self.VIDEO_ID,
+            "fb://reel/" + self.VIDEO_ID])
+
+    def _two_agent_network(self, android, crawler):
+        """Answer as Facebook did: by user agent. Each value: (final, body)."""
+        seen = []
+
+        class _Opener:
+            def open(self, req, timeout=None):
+                agent = req.get_header("User-agent", "")
+                seen.append(agent)
+                answer = crawler if "facebookexternalhit" in agent else android
+                if isinstance(answer, Exception):
+                    raise answer
+                return _FakeResponse(*answer)
+        return _Opener(), seen
+
+    def test_share_v_resolves_to_its_reel_from_the_page_head(self):
+        share = "https://www.facebook.com/share/v/19zVwRPKRW/"
+        android = (share, '<meta property="og:type" content="video.other" />'
+                          '<link rel="canonical" href="https://www.facebook.com/reel/'
+                          + self.VIDEO_ID + '/" />')
+        opener, seen = self._two_agent_network(android, AssertionError("not needed"))
+        with mock.patch.object(core, "NOPROXY", opener), mock.patch.object(core, "report_error"):
+            self.assertEqual(core.normalize_phone_url(share),
+                             "https://www.facebook.com/reel/" + self.VIDEO_ID)
+        self.assertEqual(len(seen), 1)
+
+    def test_crawler_redirect_resolves_when_the_phone_answer_names_no_post(self):
+        share = "https://www.facebook.com/share/v/19zVwRPKRW/"
+        login_wall = (share, "<html><title>Log in to Facebook</title></html>")
+        crawler = ("https://www.facebook.com/somepage/videos/" + self.VIDEO_ID +
+                   "/?rdid=boQ5VXjG5lF8t2pz&share_url=https%3A%2F%2Fwww.facebook.com"
+                   "%2Fshare%2Fv%2F19zVwRPKRW%2F", "")
+        opener, seen = self._two_agent_network(login_wall, crawler)
+        with mock.patch.object(core, "NOPROXY", opener), \
+                mock.patch.object(core, "report_error") as error:
+            resolved = core.normalize_phone_url(share)
+            variants = core._fb_uri_variants(share)
+        self.assertEqual(resolved,
+                         "https://www.facebook.com/somepage/videos/" + self.VIDEO_ID)
+        self.assertEqual(variants[1:3], ["https://www.facebook.com/reel/" + self.VIDEO_ID,
+                                         "fb://reel/" + self.VIDEO_ID])
+        error.assert_not_called()
+        self.assertEqual(len(seen), 2)
+
+    def test_crawler_also_rescues_a_share_r_after_a_network_error(self):
+        share = "https://www.facebook.com/share/r/1DTPaZadbE/"
+        crawler = ("https://www.facebook.com/reel/" + self.REEL_ID +
+                   "?rdid=jCVMk2QC8Ex4aVeB&share_url=https%3A%2F%2Fwww.facebook.com"
+                   "%2Fshare%2Fr%2F1DTPaZadbE%2F", "")
+        opener, _ = self._two_agent_network(TimeoutError("timed out"), crawler)
+        with mock.patch.object(core, "NOPROXY", opener), mock.patch.object(core, "report_error"):
+            self.assertEqual(core.normalize_phone_url(share),
+                             "https://www.facebook.com/reel/" + self.REEL_ID)
+
+    def test_story_links_are_skipped_and_odd_links_are_flagged_before_the_run(self):
+        targets = [{"url": "https://www.facebook.com/stories/123/456"},
+                   {"url": "https://www.facebook.com/zuck"},
+                   {"url": "https://www.facebook.com/reel/" + self.REEL_ID}]
+        with mock.patch.object(core, "report_error") as error, \
+                mock.patch("builtins.print"):
+            out = core.normalize_targets_for_phones(targets)
+        # A story's only box is a private Messenger reply: never typed into.
+        self.assertEqual([t["url"] for t in out],
+                         ["https://www.facebook.com/zuck",
+                          "https://www.facebook.com/reel/" + self.REEL_ID])
+        codes = [c.args[0] for c in error.call_args_list]
+        self.assertEqual(codes, ["LINK_NOT_COMMENTABLE", "LINK_NOT_SINGLE_CONTENT"])
+        for call in error.call_args_list:
+            self.assertEqual(call.kwargs["severity"], "warning")
+            self.assertIn(call.args[0], core._ERROR_HELP)
+
+    def test_unresolved_share_v_still_opens_as_a_reel_or_video(self):
+        share = "https://www.facebook.com/share/v/19zVwRPKRW"
+        opener, _ = self._two_agent_network(OSError("offline"), OSError("offline"))
+        with mock.patch.object(core, "NOPROXY", opener), mock.patch.object(core, "report_error"):
+            self.assertEqual(core.normalize_phone_url(share), share)
+        self.assertTrue(core._shows_in_reel_player(share))
 
 
 if __name__ == "__main__":

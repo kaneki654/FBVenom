@@ -4701,16 +4701,24 @@ _FB_WEB_HOST_RE = re.compile(r"(?:^|\.)facebook\.com$", re.I)
 # Facebook Gaming's short host and is how most game LIVE links are shared.
 _FB_SHORT_HOSTS = {"fb.watch", "www.fb.watch", "fb.me", "www.fb.me",
                    "fb.gg", "www.fb.gg"}
+# Facebook's own alias domain. Measured 2026-11-18: fb.com/<path> and
+# www.fb.com/<path> answer 301 to www.facebook.com/<the same path>, so they
+# are rewritten locally instead of being rejected as "not Facebook".
+_FB_ALIAS_HOSTS = {"fb.com", "www.fb.com"}
 _FB_TRACKING_KEYS = {
     "fbclid", "mibextid", "sfnsn", "rdid", "extid", "ref", "refid",
     "refsrc", "paipv", "eav", "locale", "acontext", "app", "app_id",
     "notif_id", "notif_t", "hc_ref", "__cft__", "__tn__", "_rdr",
+    # Added by Facebook's own share redirects (seen 2026-11-18 on /share/v/
+    # and /reel/ answers): "?rdid=..&share_url=.." and "?extid=reels&wtsid=..".
+    "share_url", "wtsid",
 }
 
 
 def _facebook_host(host):
     host = str(host or "").lower().rstrip(".")
-    return bool(_FB_WEB_HOST_RE.search(host) or host in _FB_SHORT_HOSTS)
+    return bool(_FB_WEB_HOST_RE.search(host) or host in _FB_SHORT_HOSTS
+                or host in _FB_ALIAS_HOSTS)
 
 
 def _url_from_pasted_text(raw):
@@ -4736,7 +4744,7 @@ def _url_from_pasted_text(raw):
     pattern = (
         r"(?i)(?<![\w.@/:-])(?:(?:facebook|fb)://[^\s<>]+|"
         r"(?:https?://|//)?(?:[a-z0-9-]+\.)*facebook\.com(?:[/?#][^\s<>]*)?|"
-        r"(?:https?://|//)?(?:www\.)?(?:fb\.watch|fb\.me|fb\.gg)"
+        r"(?:https?://|//)?(?:www\.)?(?:fb\.watch|fb\.me|fb\.gg|fb\.com)"
         r"(?:[/?#][^\s<>]*)?)(?![\w.@:-])")
     m = re.search(pattern, text)
     if m:
@@ -5144,6 +5152,11 @@ _ERROR_HELP = {
                            "Open the link manually with the same account; check access, availability and connection."),
     "SHARE_UNRESOLVED": ("The shared link could not be resolved on this computer.",
                          "The original link will still be tried on the phone; if it fails, copy the content's direct permalink from Facebook."),
+    "LINK_NOT_SINGLE_CONTENT": ("This link does not point to a single post, reel, video or photo.",
+                                "It will still be tried, but comments need one post: open it in Facebook, "
+                                "tap Share > Copy link, and paste that link instead."),
+    "LINK_NOT_COMMENTABLE": ("Stories take private replies, not public comments, so this link was skipped.",
+                             "Paste the link of a post, reel or video instead."),
     "TARGET_NOT_VERIFIED": ("The requested post view could not be verified.",
                             "Check the phone is on the intended content and has access; this link was skipped. "
                             "The phone's screen is saved in the debug folder."),
@@ -5618,6 +5631,72 @@ def has_comment_composer(d):
     return False
 
 
+def _fb_comment_box(d):
+    """Bounds of Facebook Lite's comment box wherever it sits, or None.
+
+    Across ~2,000 real dumps from the fleet the ONLY editable field Facebook
+    Lite ever showed was its comment box (a MultiAutoCompleteTextView: "Write a
+    comment…", "Sumulat ng comment...", "Comment as <name>" or a draft), so an
+    editable Facebook Lite field means a comment box is open. Fields of other
+    apps (launcher search, Google) are ignored.
+    """
+    root = hierarchy_root(d)
+    if root is None:
+        return None
+    best = None
+    for node in root.iter("node"):
+        attrs = node.attrib
+        cls = attrs.get("class", "")
+        if not ("EditText" in cls or "AutoCompleteTextView" in cls
+                or attrs.get("editable") == "true"):
+            continue
+        package = attrs.get("package")
+        if package and package != FB_PACKAGE:
+            continue
+        bounds = parse_bounds(attrs.get("bounds"))
+        if bounds and (best is None or bounds[1] > best[1]):
+            best = bounds
+    return best
+
+
+def _one_screen_read(d):
+    """A frozen Snapshot of a live phone's screen, or `d` itself.
+
+    Anything already frozen, or that is not a phone at all, is used as it is;
+    so is a live phone whose dump comes back empty (each detector then tries
+    for itself, exactly as before).
+    """
+    if (getattr(d, "_frozen", False) or not hasattr(d, "dump_hierarchy")
+            or not hasattr(d, "window_size")):
+        return d
+    try:
+        snap = Snapshot(d)
+    except Exception:
+        return d
+    return snap if snap else d
+
+
+def _reel_sheet_open(d):
+    """This thread's reel/video has its comment sheet open on screen.
+
+    With the keyboard up the sheet's box rides up to mid-screen (y=950 of 1612
+    measured) and the sheet covers the rail, so neither has_comment_composer()
+    (bottom fifth only) nor the rail check can see it - and a comment that had
+    just posted there was verified as "left the post". Search boxes sit in the
+    top of the screen and are excluded.
+    """
+    if not _is_reel_context():
+        return False
+    try:
+        box = _fb_comment_box(d)
+        if box is None:
+            return False
+        _, height = safe_window_size(d)
+        return center(box)[1] > int(height * 0.30)
+    except Exception:
+        return False
+
+
 def on_post_view(d, timeout=0.0, feed_grace=None):
     """True only when a single post (or reel) is on screen — never the feed.
 
@@ -5636,8 +5715,12 @@ def on_post_view(d, timeout=0.0, feed_grace=None):
     while True:
         if stop_requested():
             return False
+        # One read of the screen for every detector below. Each used to pull
+        # its own ~140 ms dump from the phone - four or five per check - and
+        # they could disagree, having looked at different moments.
+        view = _one_screen_read(d)
         try:
-            text = visible_text(d).lower()
+            text = visible_text(view).lower()
         except Exception:
             text = ""
         # Feed veto first: if the home/feed status composer is on screen we are
@@ -5652,7 +5735,7 @@ def on_post_view(d, timeout=0.0, feed_grace=None):
             feed_since = None
         if not on_feed:
             try:
-                if find_reel_like_point(d) is not None:
+                if find_reel_like_point(view) is not None:
                     return True      # the reel player is a single-item surface
             except Exception:
                 pass
@@ -5660,7 +5743,9 @@ def on_post_view(d, timeout=0.0, feed_grace=None):
                 return True
             # Text-free fallback: FB Lite usually exposes NO caption or marker
             # words, so the composer's shape is the only proof left.
-            if has_comment_composer(d):
+            if has_comment_composer(view):
+                return True
+            if _reel_sheet_open(view):
                 return True
         if time.time() >= deadline:
             return False
@@ -5777,10 +5862,59 @@ def _fb_native_web_url(url):
                 return base + "story.php?story_fbid=" + token + "&id=" + owner
         return base + "permalink/" + token
     return ""
+
+
+# What a link shows on the phone - and so where its comment box is:
+#   reel  - Facebook Lite's reel player. Comment is the SECOND button of the
+#           rail down the right edge (Like, Comment, Share, More) and opens a
+#           sheet with the box at the bottom. 6,593 comments in the fleet's own
+#           logs were posted that way.
+#   video - the same reel player. Facebook serves every video as a reel on a
+#           phone: measured 2026-11-18, /watch/?v=X, /<page>/videos/X and a
+#           1920x1080 /share/v/ link all answer an Android browser with
+#           https://www.facebook.com/reel/X as their canonical page, and the
+#           fleet's screenshots show landscape videos in the reel player too.
+#   post, photo, story - a single post; the box sits at its bottom.
+# /share/r|v|p/<token> carry their kind in the path even before (or without)
+# resolution, and fb.watch / fb.gg are video hosts.
+_SHARE_KINDS = {"r": "reel", "v": "video", "p": "post"}
+_target_kind_cache = {}
+
+
+def _target_kind(url):
+    """'reel', 'video', 'post', 'photo', 'story' or None (unknown)."""
+    key = str(url or "")
+    if key in _target_kind_cache:
+        return _target_kind_cache[key]
+    kind = None
+    reference = _fb_target_reference(key)
+    if reference:
+        kind = reference[0]
+    else:
+        clean = normalize_url(key)
+        if clean:
+            parts = urllib.parse.urlsplit(clean)
+            host = (parts.hostname or "").lower()
+            match = re.fullmatch(r"/share/([a-z])/[^/]+", parts.path, re.I)
+            if host in ("fb.watch", "fb.gg"):
+                kind = "video"
+            elif match:
+                kind = _SHARE_KINDS.get(match.group(1).lower())
+    if len(_target_kind_cache) > 512:
+        _target_kind_cache.clear()
+    _target_kind_cache[key] = kind
+    return kind
+
+
+def _shows_in_reel_player(url):
+    """True when Facebook Lite opens this link in its reel player."""
+    return _target_kind(url) in ("reel", "video")
 # Facebook Lite's own user agent shape. A desktop UA is answered with HTTP 400
 # on /share/ links, and facebookexternalhit returns the /videos/<slug>/<id>
-# permalink instead of the /reel/<id> form the reel player actually wants.
+# permalink instead of the /reel/<id> form the reel player actually wants -
+# which is why it is only the fallback (the ID is the same either way).
 _SHARE_UA = "Mozilla/5.0 (Linux; Android 10)"
+_CRAWLER_UA = "facebookexternalhit/1.1"
 # The canonical link lives in <head>; everything after it is app payload.
 _SHARE_HTML_LIMIT = 300000
 _CANONICAL_HREF_RE = re.compile(
@@ -5893,13 +6027,21 @@ def _canonicalize_fb_url(url):
     last_failure = "Facebook exposed no usable single-content permalink."
     # A share token carries its answer in the body, so HEAD can never resolve
     # one - skip straight to GET and save the wasted round trip.
-    methods = ("GET",) if is_share else ("HEAD", "GET")
-    for method in methods:
+    attempts = ([("GET", _SHARE_UA)] if is_share
+                else [("HEAD", _SHARE_UA), ("GET", _SHARE_UA)])
+    # A second opinion when the phone-browser answer names no post (a login or
+    # consent page, a rate limit, a network blip): Facebook's own link-preview
+    # crawler. Measured 2026-11-18, it is REDIRECTED straight to the content -
+    # /share/v/<t> -> /<page>/videos/<id>/?rdid=.., /share/r/<t> -> /reel/<id>
+    # - so even an unreadable page body still resolves. A video ID is also its
+    # reel ID, and _fb_uri_variants() adds the reel openers for it.
+    attempts.append(("GET", _CRAWLER_UA))
+    for method, agent in attempts:
         body = ""
         try:
             req = urllib.request.Request(
                 url, method=method,
-                headers={"User-Agent": _SHARE_UA,
+                headers={"User-Agent": agent,
                          "Accept-Language": "en-US,en;q=0.9"})
             with NOPROXY.open(req, timeout=10) as resp:
                 final = resp.geturl() or ""
@@ -5968,6 +6110,13 @@ def _fb_uri_variants(https_url):
             # alias; the same globally unique video ID also has a watch URL.
             # Keep the exact input first and verify every alternate on-device.
             if kind == "video":
+                if token.isdigit():
+                    # A video's ID is its reel ID, and /reel/<id> is the page
+                    # Facebook itself names for any video on a phone (measured
+                    # 2026-11-18) - the reel player, whose comment button the
+                    # run knows how to find.
+                    variants.append("https://www.facebook.com/reel/" + token)
+                    variants.append(f"fb://reel/{token}")
                 variants.append("https://www.facebook.com/watch?v=" + token)
             elif kind == "photo":
                 variants.append("https://www.facebook.com/photo.php?fbid=" + token)
@@ -6841,6 +6990,19 @@ def _reel_action_stack(d):
     # are evenly spaced.
     if not _rail_is_uniform(stack):
         return None
+    # A reel's comment SHEET lists every comment with a small Like button down
+    # the right side, and four one-line comments space those as evenly as the
+    # rail. Measured on 6 real sheets: those buttons end at x=702-704 with the
+    # comment box open, while the real rail runs to the screen edge (x=720 on
+    # all 64 real reel-player screens, which never show a comment box). Without
+    # this, a sheet passed as the reel player and "Like" or "Comment" landed on
+    # somebody's comment. A sheet whose comments are switched off has no box,
+    # but it also hides the player's progress bar (a SeekBar on 47 of the 64
+    # real player screens; every one of the 64 reaches the edge anyway).
+    if any(b[2] < width - 8 for b in stack):
+        if (_fb_comment_box(d) is not None
+                or "android.widget.SeekBar" not in (safe_dump(d) or "")):
+            return None
     if _has_post_action_row(d) and not _is_reel_context():
         return None
     return [center(b) for b in stack]
@@ -6886,8 +7048,16 @@ def find_reel_tray_points(d):
     return None
 
 def _is_reel_context():
-    u = (current_post_url() or "")
-    return bool(re.search(r"/share/r/|/reel[s]?/|/reel\b", u, re.I))
+    """True when this thread's link opens in the reel player.
+
+    Reels AND videos: Facebook Lite plays every video there (see
+    _target_kind). Only /reel/ and /share/r/ used to count, so a /share/v/,
+    fb.watch, /watch?v= or /<page>/videos/ link that opened in the reel player
+    was judged "not the target post" - the reel's author row looks like a
+    post's action row - and never got its comment (19 real fleet screens show
+    exactly that refusal on an open reel).
+    """
+    return _shows_in_reel_player(current_post_url() or "")
 
 def _wait_reel_like(d, timeout=6.0):
     pt = find_reel_like_point(d)
@@ -6899,7 +7069,12 @@ def _wait_reel_like(d, timeout=6.0):
     while time.time() < deadline:
         if not revealed:
             try:
-                d.click(int(w * 0.5), int(h * 0.5))
+                if _fb_comment_box(d) is not None:
+                    # A comment sheet covers the rail. Tapping the middle would
+                    # land on someone's comment; Back closes the sheet instead.
+                    d.press("back")
+                else:
+                    d.click(int(w * 0.5), int(h * 0.5))
             except Exception:
                 pass
             revealed = True
@@ -8336,11 +8511,28 @@ def wait_for_edit_box(d, timeout=8):
         time.sleep(0.5)
     return None
 
+def _tap_for_comment_box(serial, d, point, wait=8):
+    d.click(*point)
+    time.sleep(2)
+    if chooser_present(serial, d):
+        dismiss_chooser(serial, d)
+        time.sleep(2)
+    return wait_for_edit_box(d, timeout=wait)
+
+
 def try_open_comment_from_screen(serial, d):
     edits = edit_nodes(d)
     if edits:
         edits.sort(key=lambda e: -e[0][1])
         return center(edits[0][0])
+    if _is_reel_context():
+        point = find_reel_comment_point(d)
+        if point is not None:
+            # The reel player is up, and its rail is the ONLY way into the
+            # comments: the second button (Like, Comment, Share, More). The
+            # post guesses below were written for posts, and on a reel they
+            # can take the author row for a Comment button and open a profile.
+            return _tap_for_comment_box(serial, d, point, wait=10)
     for b, attrs in clickable_items(d):
         label = (attrs.get("content-desc") or attrs.get("text") or "").lower()
         if "comment" in label or "write a" in label:
@@ -8386,6 +8578,36 @@ def find_enter_key(d):
                 pass
     return None
 
+def _reel_surface(d):
+    """The reel player, or this reel's comment sheet, is on screen."""
+    try:
+        return find_reel_like_point(d) is not None or _reel_sheet_open(d)
+    except Exception:
+        return False
+
+
+def _retry_reel_comment_box(serial, d, tries=2):
+    """The reel is up but its comment box has not appeared yet.
+
+    Never swipe here. A vertical swipe in the reel player is NEXT REEL, and
+    every reel passes as "the post", so the post-style scroll-for-the-box loop
+    used to walk away from the target and could comment on a stranger's reel.
+    A slow sheet gets time instead, then Comment is pressed again.
+    """
+    for attempt in range(tries):
+        if not abort_sleep(1.5):
+            return None
+        box = try_open_comment_from_screen(serial, d)
+        if box is not None:
+            print(f"    [comment] reel comment box opened on retry {attempt + 1}")
+            return box
+        if stop_requested():
+            return None
+    print("    [comment] the reel's comment box never opened - not scrolling away")
+    dump_debug(serial, d, "reel_comment_box_missing")
+    return None
+
+
 def open_comment_composer(serial, d, max_scrolls=10):
     # Long captions push the comment box below the fold, so keep scrolling for
     # it — but only while we are still on the target post, so a big post is
@@ -8399,6 +8621,8 @@ def open_comment_composer(serial, d, max_scrolls=10):
     for i in range(max_scrolls):
         if stop_requested():
             return None
+        if _is_reel_context() and _reel_surface(d):
+            return _retry_reel_comment_box(serial, d)
         if not on_post_view(d):
             print("    [comment] left the target post while scrolling - stopping")
             return None
@@ -9095,11 +9319,30 @@ def normalize_targets_for_phones(targets):
         if not after:
             print(f"  [link] rejected non-Facebook or invalid URL: {before!r}")
             continue
+        kind = _target_kind(after)
+        if kind == "story":
+            # A story's only box is a PRIVATE reply (it goes to Messenger). The
+            # composer check would take it for a comment box and send a DM.
+            report_error("LINK_NOT_COMMENTABLE", url=after, severity="warning")
+            continue
+        if kind is None:
+            report_error("LINK_NOT_SINGLE_CONTENT", url=after, severity="warning")
         item["url"] = after
         if after != before:
             print(f"  [link] normalized for phones -> {after[:100]}")
+        print(f"  [link] {kind or 'unknown'}: comment box is "
+              f"{_COMMENT_PLACE.get(kind, 'found on the post view')}")
         out.append(item)
     return out
+
+
+# Where the run looks for the comment box, per link kind (for the run log).
+_COMMENT_PLACE = {
+    "reel": "behind the reel player's Comment button (2nd on the right rail)",
+    "video": "behind the reel player's Comment button (2nd on the right rail)",
+    "post": "at the bottom of the post, or behind its Comment button",
+    "photo": "at the bottom of the post, or behind its Comment button",
+}
 
 
 def react_all_saved_accounts(serial, url_or_targets, reaction="like",

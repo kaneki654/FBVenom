@@ -286,12 +286,15 @@ class ShareResolutionRetryTests(unittest.TestCase):
                 patch.object(core, "report_error"), \
                 patch.object(core.time, "monotonic", side_effect=clock.time):
             core.normalize_phone_url(self.SHARE)
+            # Each lookup asks twice: as a phone browser, then as Facebook's
+            # link-preview crawler.
+            self.assertEqual(fetch.call_count, 2)
             clock.now += 60
             core.normalize_phone_url(self.SHARE)
-            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(fetch.call_count, 2)
             clock.now += core.SHARE_RETRY_AFTER
             core.normalize_phone_url(self.SHARE)
-            self.assertEqual(fetch.call_count, 2)
+            self.assertEqual(fetch.call_count, 4)
 
 
 class PhoneInternetTests(unittest.TestCase):
