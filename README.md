@@ -455,6 +455,13 @@ for the rail.
 - If a post still cannot be verified, the phone's screen is saved once per
   phone and link to the `debug` folder
   (`<serial>_target_not_verified_<time>.png/.xml`).
+- When the phone already shows a post or reel (normally the previous link's),
+  the next link gets a fresh start of Facebook Lite instead of a quick open.
+  Measured on a TECNO KM4 with Facebook Lite 538: a quick open from one reel to
+  another left the old reel on screen for half a second, where it passed as the
+  target, then played the new reel with its buttons hidden for 14+ seconds. With
+  the fresh start, `share/r`, `share/v` and `/watch` links opened and verified
+  in 4.6–6 s instead of 17–33 s.
 
 ## Error diagnostics
 

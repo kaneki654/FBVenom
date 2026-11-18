@@ -6435,6 +6435,19 @@ def open_target_post(serial, d, url, attempts=3):
         if stop_requested():
             return False
         warm = (i == 0)
+        if warm:
+            # A screen that ALREADY passes as a post or reel - normally the
+            # previous link - makes a warm open unprovable. Measured on a TECNO
+            # KM4 (Facebook Lite 538): a warm intent for reel B while reel A was
+            # open was "delivered to the running instance"; A stayed on screen
+            # for ~0.5 s and verified as the target, then B played with its rail
+            # hidden for 14+ s, so the run reopened anyway after acting on the
+            # wrong screen's say-so. A cold start cannot show the previous link.
+            try:
+                if on_post_view(d):
+                    warm = False
+            except Exception:
+                pass
         try:
             # Verify each opener variant really reaches the post, so links whose
             # only opener is a raw https (pfbid, share) don't settle on the feed.

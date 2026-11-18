@@ -175,6 +175,19 @@ class OpenTargetPostTests(unittest.TestCase):
         core.open_target_post("phone-1", phone, "https://www.facebook.com/reel/888")
         self.assertEqual(self.dumps, ["target_not_verified"] * 2)
 
+    def test_a_screen_that_already_looks_like_a_target_gets_a_cold_start(self):
+        # The previous link's reel or post is still showing: a warm open would
+        # verify against IT (measured on a real phone), so start cold.
+        self.open_post.side_effect = [True]
+        core.open_target_post("phone-1", FakeScreen([ONLINE]), self.URL)
+        self.assertFalse(self.open_post.call_args.kwargs["allow_warm"])
+
+    def test_the_feed_or_a_menu_still_gets_the_quick_warm_open(self):
+        self.open_post.side_effect = [True]
+        with patch.object(core, "on_post_view", side_effect=[False, True]):
+            self.assertTrue(core.open_target_post("phone-1", FakeScreen([ONLINE]), self.URL))
+        self.assertTrue(self.open_post.call_args.kwargs["allow_warm"])
+
     def test_the_verifier_handed_to_open_post_is_patient(self):
         core.open_target_post("phone-1", FakeScreen([ONLINE]), self.URL, attempts=1)
         verify = self.open_post.call_args.kwargs["verify"]
