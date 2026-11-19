@@ -1,8 +1,8 @@
 {
-  "version": "1.1.9",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.9/FBVenom.exe",
-  "sha256": "2edd10f8fdc2f785f7781f42f3b13b86adc32c95ee3bd7f155deac33e98d7cb5",
-  "notes": "Share/v, share/r and video links open first time with a fresh start (no more reopening from the previous reel); comments on every reel and video link",
-  "size": 68287465,
-  "published": "2026-11-18T06:16:37+00:00"
+  "version": "1.1.10",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.10/FBVenom.exe",
+  "sha256": "3080234530ca1eac661d3a09ff3c09563262b9f1b48ba76251f3ab7609f9b7d4",
+  "notes": "ENVENOM opens Facebook Lite at once (share links never hold the phones more than 4 s); commenting starts seconds sooner; post links keep the quick open",
+  "size": 68288734,
+  "published": "2026-11-19T02:27:39+00:00"
 }

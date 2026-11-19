@@ -1,10 +1,10 @@
 {
-  "version": "1.1.9",
-  "source_commit": "6559d2606eb17144cc2953eae3d528da159fafa3",
-  "built_at": "2026-11-18T06:15:17.781911+00:00",
+  "version": "1.1.10",
+  "source_commit": "72b6d5c2307efdc04e6e9361108e7d547cc5f864",
+  "built_at": "2026-11-19T02:26:30.225214+00:00",
   "filename": "FBVenom.exe",
-  "size_bytes": 68287465,
-  "sha256": "2edd10f8fdc2f785f7781f42f3b13b86adc32c95ee3bd7f155deac33e98d7cb5",
+  "size_bytes": 68288734,
+  "sha256": "3080234530ca1eac661d3a09ff3c09563262b9f1b48ba76251f3ab7609f9b7d4",
   "format": "PE32+",
   "architecture": "x86_64",
   "subsystem": "Windows GUI",
@@ -34,5 +34,5 @@
     "archive_sha256": "7f5b1063e7895182aa60def1437e50363c3758144088dcd079037bb7c3c46a1c"
   },
   "adb_version": "Android Debug Bridge version 1.0.41",
-  "workflow_run": "https://github.com/kaneki654/FBVenom/actions/runs/44249730204"
+  "workflow_run": "https://github.com/kaneki654/FBVenom/actions/runs/44443990474"
 }
