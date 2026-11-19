@@ -4626,7 +4626,14 @@ def run(args, serial=None, timeout=60):
                            encoding="utf-8", errors="replace")
         return p.returncode, (p.stdout or ""), (p.stderr or "")
     except subprocess.TimeoutExpired:
+        if getattr(_link_check, "active", False):
+            return 1, "", "timeout"        # heal_hung_link's own probe
         report_error("ADB_TIMEOUT", serial, detail=f"command={args[0] if args else '(empty)'}")
+        # The command is NOT retried: a tap that timed out may still have
+        # landed, and a Send must never go twice. Only the link is repaired,
+        # so the caller's own next step reaches the phone again.
+        if serial and args and args[0] in ("shell", "exec-out"):
+            heal_hung_link(serial)
         return 1, "", "timeout"
     except OSError as e:
         report_error("ADB_UNAVAILABLE", serial, exc=e)
@@ -4634,6 +4641,74 @@ def run(args, serial=None, timeout=60):
     except UnicodeError as e:
         print(f"  [adb] output decode failed: {e}")
         return 1, "", "decode-error"
+
+
+# A phone's USB link can hang while ADB still lists the phone as "device".
+# Measured on a Redmi 9 phone box (cascaded USB 2.0 hubs, scrcpy mirroring every
+# phone): two phones on one sub-hub stopped answering at the same moment -
+# `adb shell echo ok` timed out on both for 7+ minutes, with no USB reset in the
+# kernel log, while `adb devices` kept saying "device". wait_online() only
+# repairs phones that are NOT "device", so nothing ever looked wrong: every
+# command ran into its timeout, again and again, and the phone sat there doing
+# nothing for the rest of the run. `adb -s <serial> reconnect` healed both at
+# once - the shell answered within a second, and the run carried on.
+HUNG_LINK_PROBE = 5.0          # an `echo` answers in ~40 ms on a healthy link
+HUNG_LINK_RETRY = 30.0         # at most one reconnect per phone per 30 s
+HUNG_LINK_RECOVER = 15.0       # how long a reconnected phone gets to answer
+_link_healed_at = {}
+_link_heal_lock = threading.Lock()
+_link_check = threading.local()     # set while heal_hung_link() runs
+
+
+def _link_answers(serial):
+    rc, out, _ = run(["shell", "echo", "ok"], serial=serial,
+                     timeout=HUNG_LINK_PROBE)
+    return rc == 0 and "ok" in (out or "")
+
+
+def heal_hung_link(serial):
+    """Reconnect a listed phone whose USB link stopped answering.
+
+    Only a phone ADB lists as "device" can have a hung link - a missing,
+    offline or unauthorized phone is wait_online()'s job. It checks first: a
+    slow command on a healthy phone is not a hung link, and then nothing is
+    touched. Only a phone that cannot even echo within HUNG_LINK_PROBE seconds
+    gets `adb reconnect` - the same as unplugging and replugging that one
+    phone. Its USB-internet tunnel, if any, is restored by the tunnel monitor
+    on its next pass. Returns True when the phone answers.
+    """
+    if not serial or stop_requested() or getattr(_link_check, "active", False):
+        return False
+    _link_check.active = True
+    try:
+        if device_state(serial) != "device":
+            return False
+        if _link_answers(serial):
+            return True
+        now = time.time()
+        with _link_heal_lock:
+            if now - _link_healed_at.get(serial, float("-inf")) < HUNG_LINK_RETRY:
+                return False
+            _link_healed_at[serial] = now
+        print(f"  [adb] {serial} is listed but stopped answering (hung USB "
+              f"link) - reconnecting it")
+        dbg(serial, "usb-link-hung", "reconnecting")
+        run(["reconnect"], serial=serial, timeout=15)
+        deadline = time.time() + HUNG_LINK_RECOVER
+        while time.time() < deadline:
+            if stop_requested():
+                return False
+            if _link_answers(serial):
+                print(f"  [adb] {serial} answers again after the reconnect.")
+                # MIUI raises "Use USB for" on every (re)connect, a moment later.
+                time.sleep(1.5)
+                dismiss_system_popup(serial)
+                return True
+            time.sleep(1.0)
+        print(f"  [adb] {serial} still not answering - check its cable and hub.")
+        return False
+    finally:
+        _link_check.active = False
 
 def list_devices():
     _, out, _ = run(["devices"])
@@ -5058,6 +5133,9 @@ def safe_dump(dev):
             xml = dev.dump_hierarchy()
         except Exception:
             if serial:
+                # A listed phone whose link hung looks "online" to
+                # wait_online(); check it can still answer, reconnect if not.
+                heal_hung_link(serial)
                 wait_online(serial)
             else:
                 time.sleep(1.0)
@@ -5070,6 +5148,10 @@ def safe_dump(dev):
             return xml                     # got the Facebook window
         if not serial or not fb_foreground(serial):
             return xml                     # can't verify, or FB really isn't up
+        # A pop-up that never goes away by itself ("Use USB for") would make
+        # the wait below run out every time: close it and read again.
+        if dismiss_system_popup(serial):
+            continue
         if attempt == 0:
             print("    [dump] got the system window instead of Facebook - "
                   "waiting for Facebook to take input focus")
@@ -5479,6 +5561,7 @@ def safe_window_size(dev):
             return sz
         except Exception:
             if serial:
+                heal_hung_link(serial)
                 wait_online(serial)
             else:
                 time.sleep(2)
@@ -5492,6 +5575,106 @@ def forget_window_size(serial=None):
             _wsize_cache.pop(serial, None)
         else:
             _wsize_cache.clear()
+    with _density_lock:
+        if serial:
+            _density_cache.pop(serial, None)
+            _density_retry_at.pop(serial, None)
+        else:
+            _density_cache.clear()
+            _density_retry_at.clear()
+
+
+# ── Screen density ─────────────────────────────────────────────────────────
+# Every size limit in the screen detectors (button widths and heights, row
+# gaps, band tolerances) is in PIXELS, measured on the fleet's 720-px phones.
+# Facebook Lite lays its screens out in dp, so one control is bigger in pixels
+# on a denser screen. The reel rail's gap proves it: 144 px on the itel
+# (720x1612), 126 px on the TECNO KM4 (720x1600), 198 px on a Redmi 9
+# (M2004J19C, 1080x2340, density 440) - 72 dp on every one of them.
+#
+# On that Redmi phone box the rail buttons measured 148x176 px, just past the
+# 140x175 limit, so the reel player was never recognised: every reel and video
+# link "would not open" and was force-stopped and reopened until it was given
+# up, while posts (found by text) still worked. The account switcher's chevron
+# (35-90 px) and every other shape test had the same ceiling.
+#
+# So each detector converts its limits with px(): the pixel size a control
+# measured on the fleet has on THIS screen. The fleet's phones draw 1.75-2.0
+# px per dp, and on them px(n) == n exactly - the limits there are untouched.
+REF_PX_PER_DP = 2.0
+_density_cache = {}
+_density_lock = threading.Lock()
+
+
+def _read_px_per_dp(dev):
+    """Pixels per dp as the phone reports them, or None.
+
+    uiautomator2 reports the screen in pixels AND in dp (`displaySizeDpX`), so
+    a live phone answers exactly. A saved dump or a test double cannot.
+    """
+    try:
+        if not isinstance(dev, u2.Device):
+            return None
+        info = dev.info or {}
+        dp_width = float(info.get("displaySizeDpX") or 0)
+        px_width = float(info.get("displayWidth") or 0)
+        if dp_width > 0 and px_width > 0:
+            return px_width / dp_width
+    except Exception:
+        pass
+    return None
+
+
+DENSITY_RETRY = 30.0           # after a failed read, judge by the screen meanwhile
+_density_retry_at = {}
+
+
+def px_per_dp(dev):
+    """Pixels per dp of this phone's screen (cached per phone)."""
+    serial = getattr(dev, "serial", None)
+    if serial:
+        with _density_lock:
+            hit = _density_cache.get(serial)
+            retry_at = _density_retry_at.get(serial, 0.0)
+        if hit:
+            return hit
+    else:
+        retry_at = 0.0
+    if time.time() >= retry_at:
+        value = _read_px_per_dp(dev)
+        if value is not None and 1.0 <= value <= 6.0:
+            if serial:
+                with _density_lock:
+                    _density_cache[serial] = value
+            return value
+        if serial and isinstance(dev, u2.Device):
+            # The phone was asked and could not say. Every screen check calls
+            # this, so do not ask again on each one while uiautomator recovers.
+            with _density_lock:
+                _density_retry_at[serial] = time.time() + DENSITY_RETRY
+    # Nothing to ask (a saved dump, a test double): phones are about 360-410
+    # dp across their SHORT side, so judge by that - 720 px reads as 2.0, the
+    # fleet itself, in portrait and in landscape (1600x720) alike.
+    try:
+        short_side = float(min(safe_window_size(dev)[:2]))
+    except Exception:
+        return REF_PX_PER_DP
+    return max(1.0, short_side / 360.0)
+
+
+def dp_scale(dev):
+    """How many times bigger, in pixels, this screen draws the controls than
+    the 720-px phones the limits were measured on. Never below 1, so the
+    fleet's own phones keep exactly the limits they were tuned with."""
+    return max(1.0, px_per_dp(dev) / REF_PX_PER_DP)
+
+
+def _scaler(dev):
+    """px(n): a size of n pixels on the fleet's phones, on this screen."""
+    k = dp_scale(dev)
+    if k <= 1.0:
+        return lambda n: n
+    return lambda n: int(round(n * k))
 
 def poll_until(check, timeout, interval=0.4):
     deadline = time.time() + timeout
@@ -5555,6 +5738,38 @@ def fb_has_focus(serial):
     for line in out.splitlines():
         if "mCurrentFocus" in line:
             return FB_PACKAGE in line
+    return False
+
+
+# System pop-ups that land on top of Facebook Lite and are safe to close with
+# Back (= Cancel, nothing changes). MIUI raises "Use USB for" every time a
+# phone's USB link connects - plugging the phone box in, and every adb
+# reconnect. Measured on a Redmi 9 (MIUI 12): it holds input focus, so each
+# dump read Settings instead of Facebook ("got the system window"), the post
+# verified as unreadable, and the run only escaped after its wander check fired.
+_DISMISSABLE_POPUPS = ("Settings$UsbDetailsActivity",)
+
+
+def dismiss_system_popup(serial):
+    """Close a known system pop-up holding focus over Facebook Lite.
+
+    Only the exact windows named in _DISMISSABLE_POPUPS are touched - never a
+    USB-debugging prompt, a permission dialog or anything else. True when one
+    was closed.
+    """
+    try:
+        _, out, _ = run(["shell", "dumpsys", "window"], serial=serial)
+    except Exception:
+        return False
+    for line in out.splitlines():
+        if "mCurrentFocus" not in line:
+            continue
+        if any(name in line for name in _DISMISSABLE_POPUPS):
+            run(["shell", "input", "keyevent", "KEYCODE_BACK"], serial=serial)
+            print(f"    [{serial}] closed the phone's 'Use USB for' pop-up")
+            dbg(serial, "popup-closed", line.strip()[:120])
+            time.sleep(0.6)
+            return True
     return False
 
 def post_ready(d):
@@ -6609,6 +6824,10 @@ class Snapshot:
         self.serial = getattr(dev, "serial", None)
         self._xml = safe_dump(dev)
         self._size = safe_window_size(dev)
+        # Learn the live phone's density now (once per phone, cached by
+        # serial), so the detectors reading this frozen copy size their
+        # limits for the real screen instead of guessing from its width.
+        px_per_dp(dev)
 
     def dump_hierarchy(self, *a, **k):
         return self._xml
@@ -6680,6 +6899,7 @@ def _wait_for_reaction_tray(d, timeout=5.0):
                 return True
         root = hierarchy_root(d)
         if root is not None:
+            px = _scaler(d)
             imgs = []
             for node in root.iter("node"):
                 if node.attrib.get("class") != "android.widget.ImageView":
@@ -6690,7 +6910,7 @@ def _wait_for_reaction_tray(d, timeout=5.0):
                     if len(parts) != 4: continue
                     x1, y1, x2, y2 = map(int, parts)
                     w, h = x2 - x1, y2 - y1
-                    if 85 <= w <= 130 and 85 <= h <= 130:
+                    if px(85) <= w <= px(130) and px(85) <= h <= px(130):
                         imgs.append(((x1 + x2) // 2, (y1 + y2) // 2))
                 except Exception:
                     pass
@@ -6718,16 +6938,17 @@ def find_action_row_like_point(d):
                         print(f"    [react] found Like by label at ({cx},{cy})")
                         return cx, cy
 
+    px = _scaler(d)
     rows = {}
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
         w = x2 - x1
         h = y2 - y1
-        if h < 35 or h > 160 or y1 < int(height * 0.20):
+        if h < px(35) or h > px(160) or y1 < int(height * 0.20):
             continue
         if w < int(width * 0.10) or w > int(width * 0.50):
             continue
-        key = (y1 // 10, y2 // 10)
+        key = (y1 // px(10), y2 // px(10))
         rows.setdefault(key, []).append(b)
 
     for _, row in sorted(rows.items(), key=lambda kv: min(b[1] for b in kv[1])):
@@ -6737,7 +6958,7 @@ def find_action_row_like_point(d):
         left  = row[0]
         right = row[-1]
         covers_width = left[0] <= int(width * 0.15) and right[2] >= int(width * 0.85)
-        same_band = (max(b[1] for b in row) - min(b[1] for b in row)) <= 30
+        same_band = (max(b[1] for b in row) - min(b[1] for b in row)) <= px(30)
         if same_band and covers_width:
             left_w = left[2] - left[0]
             if left_w > int(width * 0.45):
@@ -6752,7 +6973,7 @@ def find_action_row_like_point(d):
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
         w, h = x2 - x1, y2 - y1
-        if h < 35 or h > 160:
+        if h < px(35) or h > px(160):
             continue
         if w < int(width * 0.08) or w > int(width * 0.55):
             continue
@@ -6761,7 +6982,7 @@ def find_action_row_like_point(d):
         candidates.append(b)
     groups = {}
     for b in candidates:
-        groups.setdefault((b[1] + b[3]) // 2 // 50, []).append(b)
+        groups.setdefault((b[1] + b[3]) // 2 // px(50), []).append(b)
     for _, group in sorted(groups.items(), key=lambda kv: min(b[1] for b in kv[1])):
         if len(group) < 2:
             continue
@@ -6786,6 +7007,7 @@ def find_reaction_tray_points(d, like_point=None):
 
     root = hierarchy_root(d)
     if root is not None:
+        px = _scaler(d)
         icons = []
         for node in root.iter("node"):
             if node.attrib.get("class") != "android.widget.ImageView":
@@ -6794,14 +7016,14 @@ def find_reaction_tray_points(d, like_point=None):
             if not b:
                 continue
             bw, bh = b[2]-b[0], b[3]-b[1]
-            if 85 <= bw <= 130 and 85 <= bh <= 130:
+            if px(85) <= bw <= px(130) and px(85) <= bh <= px(130):
                 cx, cy = center(b)
-                if like_point is None or cy < like_point[1] + 10:
+                if like_point is None or cy < like_point[1] + px(10):
                     icons.append((cx, cy))
         if icons:
             bands = {}
             for cx, cy in icons:
-                bands.setdefault(round(cy / 35), []).append((cx, cy))
+                bands.setdefault(round(cy / px(35)), []).append((cx, cy))
             rows = [sorted(v) for v in bands.values() if len(v) >= 3]
             rows.sort(key=lambda r: r[0][1])
             if len(rows) >= 2 and len(rows[0]) == 3 and len(rows[1]) == 4:
@@ -6965,6 +7187,9 @@ def _rail_is_uniform(stack, width_tol=0.30, gap_tol=0.12):
 
 def _reel_action_stack(d):
     width, height = safe_window_size(d)
+    # Sizes measured on the 720-px fleet (rail buttons ~108x128 there); px()
+    # carries them to this screen - 148x176 on a 1080-px, density-440 phone.
+    px = _scaler(d)
     col = []
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
@@ -6973,7 +7198,7 @@ def _reel_action_stack(d):
         cx = (x1 + x2) // 2
         if cx < int(width * 0.82):
             continue
-        if w < 35 or w > 140 or h < 40 or h > 175:
+        if w < px(35) or w > px(140) or h < px(40) or h > px(175):
             continue
         if y1 < int(height * 0.42):
             continue
@@ -6983,11 +7208,11 @@ def _reel_action_stack(d):
     col.sort(key=lambda b: b[1])
     stack = [col[0]]
     for b in col[1:]:
-        if b[1] - stack[-1][1] >= 60:
+        if b[1] - stack[-1][1] >= px(60):
             stack.append(b)
     if len(stack) < 3:
         return None
-    if stack[-1][1] - stack[0][1] < 120:
+    if stack[-1][1] - stack[0][1] < px(120):
         return None
     if center(stack[0])[1] > int(height * 0.88):
         return None
@@ -7018,7 +7243,7 @@ def _reel_action_stack(d):
     # somebody's comment. A sheet whose comments are switched off has no box,
     # but it also hides the player's progress bar (a SeekBar on 47 of the 64
     # real player screens; every one of the 64 reaches the edge anyway).
-    if any(b[2] < width - 8 for b in stack):
+    if any(b[2] < width - px(8) for b in stack):
         if (_fb_comment_box(d) is not None
                 or "android.widget.SeekBar" not in (safe_dump(d) or "")):
             return None
@@ -7045,6 +7270,7 @@ def find_reel_tray_points(d):
     post.
     """
     width, height = safe_window_size(d)
+    px = _scaler(d)
     floor = int(height * 0.30)
     rows = {}
     for b in clickable_bounds(d):
@@ -7055,9 +7281,9 @@ def find_reel_tray_points(d):
             continue
         if w < int(width * 0.08) or w > int(width * 0.20):
             continue
-        if h < 55 or h > 145:
+        if h < px(55) or h > px(145):
             continue
-        rows.setdefault(y1 // 14, []).append(b)
+        rows.setdefault(y1 // px(14), []).append(b)
     for _, row in sorted(rows.items()):
         row = sorted(row, key=lambda b: b[0])
         if len(row) >= 7:
@@ -7118,15 +7344,16 @@ def _find_post_like(d):
     anchoring the row to the left edge is what separates them.
     """
     width, height = safe_window_size(d)
+    px = _scaler(d)
     rows = {}
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
         bw, bh = x2 - x1, y2 - y1
-        if bh < 40 or bh > 140:
+        if bh < px(40) or bh > px(140):
             continue
         if bw < int(width * 0.12) or bw > int(width * 0.42):
             continue
-        rows.setdefault(round((y1 + y2) / 2 / 26), []).append(b)
+        rows.setdefault(round((y1 + y2) / 2 / px(26)), []).append(b)
     for _, row in sorted(rows.items()):
         row = sorted(row, key=lambda b: b[0])
         if len(row) < 3:
@@ -7425,24 +7652,25 @@ def is_suspended(d):
 
 def is_suspended_layout(d):
     width, height = safe_window_size(d)
+    px = _scaler(d)
     items = clickable_items(d)
     if not (3 <= len(items) <= 6):
         return False
     points = [(b, center(b)) for b, _ in items]
     has_top_right = any(
         x > int(width * 0.85) and int(height * 0.04) <= y <= int(height * 0.12)
-        and 40 <= b[2]-b[0] <= 90 and 40 <= b[3]-b[1] <= 90
+        and px(40) <= b[2]-b[0] <= px(90) and px(40) <= b[3]-b[1] <= px(90)
         for b, (x, y) in points)
     has_profile = any(
         int(width*0.40) <= x <= int(width*0.60) and
         int(height*0.10) <= y <= int(height*0.22) and
-        70 <= b[2]-b[0] <= 130 and 70 <= b[3]-b[1] <= 130
+        px(70) <= b[2]-b[0] <= px(130) and px(70) <= b[3]-b[1] <= px(130)
         for b, (x, y) in points)
     has_appeal_button = any(
         int(width*0.03) <= b[0] <= int(width*0.08) and
         b[2] >= int(width*0.92) and
         int(height*0.35) <= y <= int(height*0.48) and
-        45 <= b[3]-b[1] <= 90
+        px(45) <= b[3]-b[1] <= px(90)
         for b, (x, y) in points)
     return has_top_right and has_profile and has_appeal_button
 
@@ -7551,13 +7779,14 @@ def open_fb_home(serial, d, force=True):
 
 def find_gear_icon(d):
     width, height = safe_window_size(d)
+    px = _scaler(d)
     candidates = []
     for b, attrs in clickable_items(d):
         cx, cy = center(b)
         if cy > int(height * 0.12) or cx < int(width * 0.80):
             continue
         w, h = b[2]-b[0], b[3]-b[1]
-        if 40 <= w <= 100 and 40 <= h <= 100:
+        if px(40) <= w <= px(100) and px(40) <= h <= px(100):
             candidates.append((cx, b))
     if not candidates:
         return None
@@ -7592,13 +7821,14 @@ def find_logout_row(d):
         if "log out" in low or "logout" in low:
             return center(b)
     width, height = safe_window_size(d)
+    px = _scaler(d)
     sheet_rows = []
     for b, _ in clickable_items(d):
         w  = b[2]-b[0]
         h  = b[3]-b[1]
         cx, cy = center(b)
         if (b[0] <= int(width*0.08) and b[2] >= int(width*0.90) and
-                cy > int(height*0.70) and w > int(width*0.75) and h >= 50):
+                cy > int(height*0.70) and w > int(width*0.75) and h >= px(50)):
             sheet_rows.append((cy, b))
     if len(sheet_rows) >= 2:
         return center(sorted(sheet_rows)[-1][1])
@@ -7615,6 +7845,7 @@ def confirm_logout_if_needed(d):
                 time.sleep(3)
                 return True
     width, height = safe_window_size(d)
+    px = _scaler(d)
     buttons = []
     for b, _ in clickable_items(d):
         w  = b[2]-b[0]
@@ -7622,7 +7853,7 @@ def confirm_logout_if_needed(d):
         cx, cy = center(b)
         if (int(width*0.15) <= cx <= int(width*0.85) and
                 int(height*0.52) <= cy <= int(height*0.62) and
-                150 <= w <= 260 and 45 <= h <= 90):
+                px(150) <= w <= px(260) and px(45) <= h <= px(90)):
             buttons.append((cx, b))
     if len(buttons) >= 2:
         d.click(*center(sorted(buttons)[0][1]))
@@ -7651,6 +7882,7 @@ def logout_current_account(serial, d):
 
 def login_screen_account_rows(d):
     width, height = safe_window_size(d)
+    px = _scaler(d)
     rows = []
     for b, attrs in clickable_items(d):
         desc = normalize_account_name(attrs.get("content-desc") or attrs.get("text"))
@@ -7660,7 +7892,7 @@ def login_screen_account_rows(d):
         if any(skip in low for skip in ACCOUNT_SKIP_TEXT):
             continue
         w, h = b[2]-b[0], b[3]-b[1]
-        if w < int(width * 0.50) or h < 60:
+        if w < int(width * 0.50) or h < px(60):
             continue
         rows.append({"name": desc, "bounds": b, "point": center(b)})
     deduped, seen = [], set()
@@ -7700,6 +7932,7 @@ def find_switch_account_arrow(d):
             return None
     except Exception:
         pass
+    px = _scaler(d)
     arrows = []
     for b, _ in clickable_items(d):
         x1, y1, x2, y2 = b
@@ -7708,7 +7941,7 @@ def find_switch_account_arrow(d):
         cx, cy = center(b)
         if cx < int(width*0.78) or cy < int(height*0.12) or cy > int(height*0.34):
             continue
-        if 35 <= w <= 90 and 35 <= h <= 90:
+        if px(35) <= w <= px(90) and px(35) <= h <= px(90):
             arrows.append((cy, cx, b))
     if not arrows:
         return None
@@ -7795,10 +8028,11 @@ def _uniform_stack(d, min_rows=2, min_w=0.50):
     x-range, one height, and sits flush against the next.
     """
     width, height = safe_window_size(d)
+    px = _scaler(d)
     rows = []
     for b, _ in clickable_items(d):
         w, h = b[2] - b[0], b[3] - b[1]
-        if w < int(width * min_w) or h < 60 or h > 260:
+        if w < int(width * min_w) or h < px(60) or h > px(260):
             continue
         if b[1] < int(height * 0.10):
             continue
@@ -7820,7 +8054,7 @@ def _uniform_stack(d, min_rows=2, min_w=0.50):
     # to the loose group, which is what defeated this check before.
     best_run, run = [], [best[0]]
     for b in best[1:]:
-        if abs(b[1] - run[-1][3]) <= max(12, (b[3] - b[1]) // 6):
+        if abs(b[1] - run[-1][3]) <= max(px(12), (b[3] - b[1]) // 6):
             run.append(b)
         else:
             if len(run) > len(best_run):
@@ -7842,7 +8076,7 @@ def find_menu_button_geometric(d):
     # bar is also small and also touches the right edge, so a plain "rightmost
     # near the top" picks Marketplace instead of the hamburger.
     top_y = min(b[1] for b in top)
-    band = [b for b in top if b[1] - top_y <= 40]
+    band = [b for b in top if b[1] - top_y <= _scaler(d)(40)]
     right = max(band, key=lambda b: b[2])
     if right[2] < int(width * 0.80):     # must actually hug the right edge
         return None
@@ -7869,9 +8103,10 @@ def find_switch_account_card(d):
         return None
     wide.sort(key=lambda b: b[1])
     # drop nested duplicates: keep one card per y-band
+    band = _scaler(d)(40)
     picked = []
     for b in wide:
-        if picked and b[1] - picked[-1][1] < 40:
+        if picked and b[1] - picked[-1][1] < band:
             continue
         picked.append(b)
     if len(picked) < 2:
@@ -8067,6 +8302,7 @@ def account_rows(d):
     if not switcher_is_open(d):
         return []
     width, height = safe_window_size(d)
+    px = _scaler(d)
     cands = []
     for b, attrs in clickable_items(d):
         desc = normalize_account_name(attrs.get("content-desc") or attrs.get("text"))
@@ -8076,7 +8312,7 @@ def account_rows(d):
         if any(skip in low for skip in ACCOUNT_SKIP_TEXT):
             continue
         w, h = b[2] - b[0], b[3] - b[1]
-        if w < int(width * 0.50) or h < 60 or h > 220:
+        if w < int(width * 0.50) or h < px(60) or h > px(220):
             continue
         if b[1] < int(height * 0.12):        # keep out of the top app bar only
             continue
@@ -8427,12 +8663,13 @@ def find_reel_comment_point(d):
 
 def find_feed_action_row(d):
     width, height = safe_window_size(d)
+    px = _scaler(d)
     rows = {}
     for b in clickable_bounds(d):
         x1, y1, x2, y2 = b
         w = x2-x1
         h = y2-y1
-        if h < 40 or h > 140:
+        if h < px(40) or h > px(140):
             continue
         # Current Lite uses narrow Like / Comment / Share pills, often only
         # 14% of the screen wide. Match the same measured band as
@@ -8440,12 +8677,12 @@ def find_feed_action_row(d):
         # a reaction row but no discoverable Comment button.
         if w < int(width * 0.12) or w > int(width * 0.55):
             continue
-        rows.setdefault(round((y1 + y2) / 2 / 26), []).append(b)
+        rows.setdefault(round((y1 + y2) / 2 / px(26)), []).append(b)
     for _, row in sorted(rows.items()):
         row = sorted(row, key=lambda b: b[0])
         if not 2 <= len(row) <= 4:
             continue
-        same_band = max(b[1] for b in row) - min(b[1] for b in row) <= 24
+        same_band = max(b[1] for b in row) - min(b[1] for b in row) <= px(24)
         covers = row[0][0] <= int(width * 0.12) and row[-1][2] >= int(width * 0.55)
         if len(row) == 2:
             # Some group layouts have only Like and Comment when sharing is
@@ -8722,7 +8959,7 @@ def find_send_button(d):
         cy = (y1 + y2) // 2
         if composer is None:
             # Nothing to anchor to: stay clear of the system navigation bar.
-            return y1 >= int(height * 0.25) and cy <= height - 100
+            return y1 >= int(height * 0.25) and cy <= height - _scaler(d)(100)
         margin = max(24, int(height * 0.025))
         return composer[1] - margin <= cy <= composer[3] + margin
 
@@ -9444,6 +9681,12 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
 
     wake_and_unlock(serial)
     run(["shell", "svc", "power", "stayon", "true", "usb"], serial=serial)
+    # A phone box plugged in moments ago can still be showing MIUI's
+    # "Use USB for" over everything.
+    try:
+        dismiss_system_popup(serial)
+    except Exception:
+        pass
     # A USB-internet VPN left by a crashed or killed session keeps the phone
     # "connected" with no way out, so no post could ever load.
     try:

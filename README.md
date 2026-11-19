@@ -475,6 +475,52 @@ for the rail.
   simulated phone, commenting now starts 1.5–2.5 s after ENVENOM instead of
   7.5–9.3 s.
 
+### Any phone box
+
+Since 1.1.12 the run adapts to the phones it finds instead of assuming the
+fleet's own. Each item was measured on a box of eight Redmi 9 phones
+(M2004J19C, MIUI 12, Android 10, 1080x2340 at density 440) on cascaded USB 2.0
+hubs, with scrcpy mirroring every phone.
+
+- **Screen sizes are judged in dp, not pixels.** Every size limit in the screen
+  checks was measured on the fleet's 720-px phones. Facebook Lite draws in dp, so
+  a denser screen draws the same button bigger: the reel rail's gap is 144 px on
+  the itel, 126 px on the TECNO KM4 and 198 px on the Redmi, which is 72 dp on
+  all three. The Redmi's rail buttons are 148x176 px, just past the old
+  140x175 limit, so no reel or video ever counted as open. Each one was closed
+  and reopened until it was given up, while posts (found by their text) still
+  worked. The account switcher's chevron had the same ceiling. Each phone's
+  density is now read from the phone itself (uiautomator2 reports its screen in
+  dp too) and every limit is converted for it. The fleet's own phones keep
+  their limits exactly: 1,017 saved fleet screens replayed through the old and
+  new checks gave 0 differences in 34,578 decisions. On the Redmi box, 6 phones
+  x 3 links (post, reel, video) all reached Send in 50–62 s per phone, and the
+  switcher found all 8 accounts on every phone.
+- **A hung USB link is reconnected.** Two phones on one sub-hub stopped
+  answering for 7+ minutes while `adb devices` still listed them as `device`,
+  with no USB reset in the kernel log. Nothing looked wrong, so every command
+  ran into its 60-second timeout and the phone did nothing for the rest of the
+  run. Now, when a command times out on a listed phone, FBVenom first checks
+  whether the phone still answers. If it can't even echo within 5 s, it runs
+  `adb reconnect` for that one phone (the same as replugging it), at most once
+  every 30 s. On the Redmi box this brought both phones back within a second.
+  The timed-out command is never sent again (a tap may have landed, and a Send
+  must never go twice). Missing, offline and unauthorized phones are left to
+  the normal wait.
+- **MIUI's "Use USB for" pop-up is closed.** MIUI raises it whenever a phone's
+  USB link connects (plugging the box in, and every reconnect). It holds input
+  focus, so the screen read Settings instead of Facebook. It is closed with
+  Back (Cancel, nothing changes) when a phone starts, after a reconnect, and
+  whenever a read finds it on top. A USB-debugging prompt or any other dialog
+  is never touched.
+
+When you plug in a new phone box, every phone has to trust this PC once: unlock
+it and tap **Allow** (tick *Always allow from this computer*) on the USB
+debugging prompt. A phone that stays `UNAUTHORIZED`: Developer options →
+*Revoke USB debugging authorizations*, switch USB debugging off and on, replug,
+and tap Allow. On Xiaomi/Redmi (MIUI) also turn on *USB debugging (Security
+settings)* and *Install via USB*, or Android refuses the taps.
+
 ## Error diagnostics
 
 Errors print with stable codes, a timestamp, the phone/account/link context
