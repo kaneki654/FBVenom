@@ -1,8 +1,8 @@
 {
-  "version": "1.1.10",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.10/FBVenom.exe",
-  "sha256": "3080234530ca1eac661d3a09ff3c09563262b9f1b48ba76251f3ab7609f9b7d4",
-  "notes": "ENVENOM opens Facebook Lite at once (share links never hold the phones more than 4 s); commenting starts seconds sooner; post links keep the quick open",
-  "size": 68288734,
-  "published": "2026-11-19T02:27:39+00:00"
+  "version": "1.1.11",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.11/FBVenom.exe",
+  "sha256": "6012cb9ab26b573138cf706c96dc861d4cb429413f60ccc0c98dc3c7289508ca",
+  "notes": "Comments are written straight into the box, so posts get their comments again (typing used to throw the phone back to the feed); reels, videos and share links still open at once",
+  "size": 68289163,
+  "published": "2026-11-19T02:57:09+00:00"
 }
