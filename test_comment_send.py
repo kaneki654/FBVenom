@@ -4,6 +4,7 @@ Every geometry below is copied from the phones' own debug dumps (FBPoison and
 FBVenom debug folders, all 720 px wide), with names and post text replaced.
 No phone, ADB or network is used.
 """
+from html import escape
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -219,22 +220,60 @@ class PostCommentTests(unittest.TestCase):
 
 
 class TypeTextTests(unittest.TestCase):
-    def test_unicode_draft_gets_one_real_keystroke_after_set_text(self):
-        calls = []
-        phone = Phone(new_gesture(text=""))
+    """Typing into the comment box without a single keystroke.
+
+    Measured live on a TECNO KM4 (Facebook Lite 538): the post's "Comment as"
+    box drops focus after 2-3 injected keystrokes, the rest move focus to the
+    header's Back arrow, and a typed space presses it. set_text wrote the full
+    comment and the Send arrow appeared; the input method's send_keys did too.
+    """
+
+    def type(self, text, set_text_works=True, ime_works=True):
+        adb, phone = [], Phone(new_gesture(text="Comment as Test User"))
+        used = []
 
         class Field:
             exists = True
 
-            def set_text(self, text):
-                phone.xml = new_gesture(text=text)
-        phone.__class__ = type("UnicodePhone", (Phone,), {"__call__": lambda self, **k: Field()})
-        with patch.object(core, "run", side_effect=lambda args, serial=None, timeout=60: calls.append(args) or (0, "", "")), \
+            def set_text(self, value):
+                used.append("set_text")
+                if set_text_works:
+                    phone.xml = new_gesture(text=escape(value))
+
+        def send_keys(value):
+            used.append("send_keys")
+            if ime_works:
+                phone.xml = new_gesture(text=escape(value))
+        phone.__class__ = type("BoxPhone", (Phone,), {"__call__": lambda self, **k: Field()})
+        phone.send_keys = send_keys
+        with patch.object(core, "run", side_effect=lambda args, serial=None, timeout=60:
+                          adb.append(args) or (0, "", "")), \
                 patch.object(core, "abort_sleep", return_value=True), \
                 patch.object(core, "stop_requested", return_value=False), \
                 patch.object(core.time, "sleep"):
-            self.assertTrue(core.type_text("phone-5", phone, (294, 1554), "grabe 🤣🤣🤣"))
-        self.assertIn(["shell", "input", "keyevent", "KEYCODE_SPACE", "KEYCODE_DEL"], calls)
+            ok = core.type_text("phone-5", phone, (294, 1554), text)
+        return ok, used, adb
+
+    def test_every_comment_is_written_into_the_box_with_no_keystrokes(self):
+        for text in ("grabe ang ganda ng video", "grabe 🤣🤣🤣", "ok (yes) & 100% sure?"):
+            with self.subTest(text=text):
+                ok, used, adb = self.type(text)
+                self.assertTrue(ok)
+                self.assertEqual(used, ["set_text"])
+                # No `input text`, no Backspace clearing, no space-then-delete:
+                # each of those can land on the Back arrow once focus is gone.
+                self.assertEqual(adb, [])
+
+    def test_the_input_method_takes_over_when_set_text_does_not_land(self):
+        ok, used, adb = self.type("salamat sa balita", set_text_works=False)
+        self.assertTrue(ok)
+        self.assertEqual(used, ["set_text", "send_keys"])
+        self.assertEqual(adb, [])
+
+    def test_a_draft_that_never_reaches_the_box_fails_cleanly(self):
+        ok, used, adb = self.type("salamat sa balita", set_text_works=False, ime_works=False)
+        self.assertFalse(ok)
+        self.assertEqual(adb, [])
 
 
 if __name__ == "__main__":

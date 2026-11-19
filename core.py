@@ -8771,83 +8771,60 @@ def find_send_button(d):
     return None
 
 def type_text(serial, d, point, text):
+    """Put the comment into Facebook Lite's comment box - never key by key.
+
+    Measured live on a TECNO KM4 (Facebook Lite 538, the "Comment as <name>"
+    box on posts): after 2-3 injected keystrokes the box drops focus and the
+    keyboard closes. The remaining keystrokes then move focus to the header's
+    Back arrow, and a typed space PRESSES it - the draft is lost and the phone
+    lands on the news feed (or the previous reel). `adb shell input text "x y"`
+    put "tes" in the box and then went back; key events T,E,S,T put "te".
+    uiautomator2's set_text wrote the whole comment, and the Send arrow
+    appeared without a single keystroke; its input-method send_keys did too.
+    So: write the text into the field, verify it is IN the field, and send no
+    keystrokes at all - no Backspace clearing (set_text replaces the content,
+    and a Backspace with nothing focused is not harmless either), and no extra
+    space-then-delete afterwards.
+    """
     if stop_requested():
         return False
-    d.click(*point)
-    if not abort_sleep(1.2):
+    d.click(*point)                  # focus the box, as a person would
+    if not abort_sleep(1.0):
         return False
-    try:
-        # ONE adb round trip, not 43. `input keyevent` accepts a whole list of
-        # keycodes, and each separate invocation costs ~200ms on these phones,
-        # so the old 40-iteration clearing loop spent ~8s on EVERY comment -
-        # measured 8.9s to type 4 characters. Same keystrokes, same effect.
-        run(["shell", "input", "keyevent", "KEYCODE_CTRL_A", "KEYCODE_DEL",
-             "KEYCODE_MOVE_END"] + ["KEYCODE_DEL"] * 40, serial=serial)
-        abort_sleep(0.2)
-    except Exception:
-        pass
-    safe_text = (text
-                .replace("\\", "\\\\")
-                .replace("'", "\\'")
-                .replace('"', '\\"')
-                .replace("&", "\\&")
-                .replace("<", "\\<")
-                .replace(">", "\\>")
-                .replace("|", "\\|")
-                .replace(";", "\\;")
-                .replace("(", "\\(")
-                .replace(")", "\\)")
-                .replace("$", "\\$")
-                .replace("`", "\\`")
-                .replace("*", "\\*")
-                .replace("?", "\\?")
-                .replace("[", "\\[")
-                .replace("]", "\\]")
-                .replace("{", "\\{")
-                .replace("}", "\\}")
-                .replace("~", "\\~")
-                .replace(" ", "%s"))
-    typed = text.strip()[:15].lower()
+    want = " ".join(text.strip().lower().split())[:15]
 
-    def _via_adb():
-        run(["shell", "input", "text", safe_text], serial=serial)
+    def field_has_draft():
+        for _bounds, attrs in edit_nodes(d):
+            cls = attrs.get("class", "")
+            if ("EditText" in cls or "AutoCompleteTextView" in cls
+                    or attrs.get("editable") == "true"):
+                if want and want in " ".join(attrs.get("text", "").lower().split()):
+                    return True
+        return False
+
+    def _set_text():
+        box = d(className="android.widget.MultiAutoCompleteTextView")
+        if not box.exists:
+            box = d(className="android.widget.EditText")
+        box.set_text(text)
         time.sleep(0.8)
-        return typed in visible_text(d).lower()
+        return field_has_draft()
 
-    def _via_u2():
-        el = d(className="android.widget.MultiAutoCompleteTextView")
-        if not el.exists:
-            el = d(className="android.widget.EditText")
-        el.set_text(text)
+    def _input_method():
+        # uiautomator2's own input method: committed text, not key events.
+        d.send_keys(text)
         time.sleep(0.8)
-        # set_text fills the field without a single key event. One real
-        # keystroke (a space, then deleting it) makes Facebook Lite notice the
-        # draft the way it notices typing, so its Send control follows.
-        try:
-            run(["shell", "input", "keyevent", "KEYCODE_SPACE", "KEYCODE_DEL"],
-                serial=serial)
-            time.sleep(0.3)
-        except Exception:
-            pass
-        return typed in visible_text(d).lower()
+        return field_has_draft()
 
-    # `adb shell input text` is ASCII-only: an emoji either vanishes or arrives
-    # as garbage, and when it sits past the first 15 characters the check below
-    # still passes, so the comment posts with the emoji quietly missing. Anything
-    # non-ASCII therefore goes through uiautomator2's set_text first, which
-    # takes arbitrary Unicode, and falls back to adb rather than the reverse.
-    order = ((_via_u2, _via_adb) if any(ord(c) > 127 for c in text)
-             else (_via_adb, _via_u2))
-    ok = False
-    for fn in order:
+    for fn in (_set_text, _input_method):
         try:
-            ok = fn()
+            if fn():
+                return True
         except Exception as e:
-            print(f"    [type] {fn.__name__} failed: {e}")
-            ok = False
-        if ok:
-            break
-    return ok
+            print(f"    [type] {fn.__name__} failed: {type(e).__name__}: {e}")
+        if stop_requested():
+            return False
+    return False
 
 def post_comment(serial, d, text):
     """Submit once, and count only a verified composer-clear transition.

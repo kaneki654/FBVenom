@@ -492,6 +492,17 @@ from an observable composer on the post. If a send was attempted but cannot be
 verified, the session reports it as unverified and does not automatically resend
 that account/link pair; inspect the post before retrying it manually.
 
+The comment is written straight into the comment box (uiautomator2
+`set_text`, with its input method's `send_keys` as the fallback). It is never
+typed key by key, and no Backspace or other keystroke is sent. Measured live
+on a TECNO KM4 with Facebook Lite 538: the post's "Comment as <name>" box
+drops focus after 2–3 typed keystrokes, the rest move focus to the header's
+Back arrow, and a typed space presses it. The draft was lost and the phone
+landed on the news feed or the previous reel, which is how comments on posts
+stopped being sent. Written directly, the whole comment lands in the box and
+the Send arrow appears. 1.1.11 typed and found Send on a `share/v` reel, a
+`share/p` post and another reel in a row on that phone.
+
 The Send control is found beside the comment field itself: the rightmost
 icon level with any part of the draft, at any screen size, keyboard up or
 down, with or without Android's button bar, and for a draft that has wrapped
