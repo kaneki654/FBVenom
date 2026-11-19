@@ -6212,6 +6212,7 @@ def _post_view_attempts(uri):
 # on the news feed still fails fast: the feed only gets OPEN_FEED_GRACE.
 OPEN_VERIFY_SECONDS = 15.0
 OPEN_FEED_GRACE = 4.0
+WARM_SETTLE = 1.5
 
 # ── Phone connectivity ─────────────────────────────────────────────────────
 # Android's status bar names a connection without internet in the icon's
@@ -6381,6 +6382,11 @@ def open_post(serial, url, allow_warm=True, verify=None):
                                   ("error", "exception", "unable to resolve", "not found")):
                     failures.append(f"intent rc={rc}: {low[:240]}")
                     continue
+                # The previous screen stays up for a moment after a warm intent
+                # (~0.5 s measured on a TECNO KM4) and can pass the check as if
+                # it were the new post. Let the new screen replace it first.
+                if not abort_sleep(WARM_SETTLE):
+                    return False
                 if _reached():
                     print(f"  [{serial}] post opened warm ({uri[:60]})")
                     return True
@@ -6435,14 +6441,14 @@ def open_target_post(serial, d, url, attempts=3):
         if stop_requested():
             return False
         warm = (i == 0)
-        if warm:
-            # A screen that ALREADY passes as a post or reel - normally the
-            # previous link - makes a warm open unprovable. Measured on a TECNO
-            # KM4 (Facebook Lite 538): a warm intent for reel B while reel A was
-            # open was "delivered to the running instance"; A stayed on screen
-            # for ~0.5 s and verified as the target, then B played with its rail
-            # hidden for 14+ s, so the run reopened anyway after acting on the
-            # wrong screen's say-so. A cold start cannot show the previous link.
+        if warm and _shows_in_reel_player(url):
+            # A reel or video opened warm while a post or reel is on screen is
+            # unprovable. Measured on a TECNO KM4 (Facebook Lite 538): a warm
+            # intent for reel B while reel A was open was "delivered to the
+            # running instance"; A stayed on screen for ~0.5 s and verified as
+            # the target, then B played with its rail hidden for 14+ s, so the
+            # run reopened anyway. A cold start opened it in 4.6-6 s. Post links
+            # keep the quick warm open (open_post waits WARM_SETTLE first).
             try:
                 if on_post_view(d):
                     warm = False
@@ -9308,27 +9314,69 @@ def make_target(url, reaction="like", comment="", do_react=True, do_comment=Fals
             "do_comment": bool(do_comment)}
 
 
-def normalize_targets_for_phones(targets):
+# Longest ENVENOM holds the phones for share-link lookups. A lookup normally
+# answers in ~1 s; one that has not by then is not worth every phone sitting
+# idle (a failing one could take 20 s: two attempts of 10 s each). Facebook
+# Lite opens a /share/ link by itself - measured on a TECNO KM4 (FB Lite 538),
+# an unresolved /share/v/ link opened and verified in 4.6 s - so the phones get
+# the cleaned share link and the lookup finishes in the background, cached for
+# the next run.
+RESOLVE_BUDGET = 4.0
+_lookup_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="link-lookup")
+_lookups = {}
+_lookups_lock = threading.Lock()
+
+
+def _lookup(url):
+    """One shared background lookup per link (finished ones re-run from cache)."""
+    key = normalize_url(url) or str(url or "")
+    with _lookups_lock:
+        future = _lookups.get(key)
+        if future is None or future.done():
+            future = _lookup_pool.submit(normalize_phone_url, key)
+            _lookups[key] = future
+        return future
+
+
+def normalize_targets_for_phones(targets, budget=None):
     """Resolve every target once before any phone worker receives it.
 
-    Resolution is a network fetch per share link (~0.9s each), and it used to
-    run one link after another with the phones idle the whole time - fifteen
-    links meant ~13s of nothing happening after the button was pressed. They
-    are independent, so they run together and the wall time is one link's.
+    Resolution is a network fetch per share link (~0.9s each). They run
+    together, and the phones wait at most `budget` seconds (RESOLVE_BUDGET) for
+    them: a link still being looked up goes to the phones as its cleaned share
+    link. Targets this already prepared (the GUI does it once before fan-out)
+    pass straight through, so every phone keeps the SAME URL - the per-post
+    wording pool that keeps comments from repeating is keyed by it.
     """
     items = [dict(t) for t in (targets or [])]
     if not items:
         return []
-    if len(items) > 1:
-        pool = min(len(items), 8)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=pool) as ex:
-            resolved = list(ex.map(
-                lambda it: normalize_phone_url(it.get("url", "")), items))
-    else:
-        resolved = [normalize_phone_url(items[0].get("url", ""))]
+    budget = RESOLVE_BUDGET if budget is None else float(budget)
+    deadline = time.monotonic() + budget
+    futures = [None if item.get("phone_ready") else _lookup(item.get("url", ""))
+               for item in items]
+    resolved = []
+    for item, future in zip(items, futures):
+        if future is None:
+            resolved.append(item.get("url", ""))
+            continue
+        try:
+            resolved.append(future.result(timeout=max(0.0, deadline - time.monotonic())))
+        except concurrent.futures.TimeoutError:
+            clean = normalize_url(item.get("url", ""))
+            print(f"  [link] lookup still running after {budget:.0f}s - phones open "
+                  f"{clean[:80]} directly (Facebook Lite resolves it)")
+            resolved.append(clean)
+        except Exception:
+            resolved.append(normalize_url(item.get("url", "")))
     out = []
     for item, after in zip(items, resolved):
         before = item.get("url", "")
+        if item.get("phone_ready"):
+            if after:
+                out.append(item)
+            continue
         if not after:
             print(f"  [link] rejected non-Facebook or invalid URL: {before!r}")
             continue
@@ -9341,6 +9389,7 @@ def normalize_targets_for_phones(targets):
         if kind is None:
             report_error("LINK_NOT_SINGLE_CONTENT", url=after, severity="warning")
         item["url"] = after
+        item["phone_ready"] = True
         if after != before:
             print(f"  [link] normalized for phones -> {after[:100]}")
         print(f"  [link] {kind or 'unknown'}: comment box is "
@@ -9543,7 +9592,11 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                 results.append("safety-stop-no-link-opens")
                 break
 
-        status = wait_for_account_block(d)
+        # A verified post on screen already proves this account is logged in
+        # and not suspended, so one look is enough. Watching a healthy account
+        # for 6 s - it can never return early - was 6 s of nothing after every
+        # account's first link opened. Only a gate that opened NOTHING waits.
+        status = wait_for_account_block(d, timeout=0 if gate_link_no else 6)
         if status == "not-successful":
             results.append(status)
             report_error("ACCOUNT_LOGIN_REQUIRED", serial, account_num=account_num)

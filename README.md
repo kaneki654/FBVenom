@@ -455,13 +455,25 @@ for the rail.
 - If a post still cannot be verified, the phone's screen is saved once per
   phone and link to the `debug` folder
   (`<serial>_target_not_verified_<time>.png/.xml`).
-- When the phone already shows a post or reel (normally the previous link's),
-  the next link gets a fresh start of Facebook Lite instead of a quick open.
-  Measured on a TECNO KM4 with Facebook Lite 538: a quick open from one reel to
-  another left the old reel on screen for half a second, where it passed as the
-  target, then played the new reel with its buttons hidden for 14+ seconds. With
-  the fresh start, `share/r`, `share/v` and `/watch` links opened and verified
-  in 4.6–6 s instead of 17–33 s.
+- ENVENOM opens Facebook Lite at once. Share links are looked up on the PC for
+  at most 4 seconds (`RESOLVE_BUDGET`). A lookup still running after that keeps
+  going in the background for the next run, and the phones open the cleaned
+  share link, which Facebook Lite resolves itself. On a TECNO KM4 an unresolved
+  `share/v` link opened and verified in 4.6 s. Every phone uses the same link,
+  so comments never repeat across phones.
+- A **reel or video** link opened while a post or reel is on screen gets a
+  fresh start of Facebook Lite. Measured on a TECNO KM4 with Facebook Lite 538:
+  a quick open from one reel to another left the old reel on screen for half a
+  second, where it passed as the target, then played the new reel with its
+  buttons hidden for 14+ seconds. With the fresh start, `share/r`, `share/v` and
+  `/watch` links opened and verified in 4.6–6 s instead of 17–33 s. **Post
+  links** keep the quick open, which waits 1.5 s (`WARM_SETTLE`) before
+  checking, so the previous screen cannot pass for the new post.
+- Once an account's first link is verified on screen, the login and suspension
+  check takes one look instead of watching for 6 seconds: an open post already
+  proves the account is logged in. Measured with the real window and a
+  simulated phone, commenting now starts 1.5–2.5 s after ENVENOM instead of
+  7.5–9.3 s.
 
 ## Error diagnostics
 

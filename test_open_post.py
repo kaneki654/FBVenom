@@ -198,6 +198,67 @@ class OpenTargetPostTests(unittest.TestCase):
                                                  "feed_grace": core.OPEN_FEED_GRACE})
 
 
+class QuickOpenTests(unittest.TestCase):
+    """What ENVENOM does in its first seconds on the phone."""
+
+    def setUp(self):
+        self.calls = []
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(core, "stop_requested", return_value=False))
+        stack.enter_context(patch.object(core, "wait_online", return_value=True))
+        stack.enter_context(patch.object(core, "fb_foreground", return_value=True))
+        stack.enter_context(patch.object(core, "poll_until", return_value=True))
+        stack.enter_context(patch.object(core, "run", side_effect=lambda args, serial=None, timeout=60:
+                                         self.calls.append(("adb", " ".join(args))) or (0, "Starting", "")))
+        stack.enter_context(patch.object(core, "abort_sleep", side_effect=lambda s:
+                                         self.calls.append(("sleep", s)) or True))
+
+    def test_a_warm_open_lets_the_new_screen_replace_the_old_before_checking(self):
+        def verify():
+            self.calls.append(("verify", None))
+            return True
+        self.assertTrue(core.open_post("phone-1", "https://www.facebook.com/page/posts/123",
+                                       allow_warm=True, verify=verify))
+        kinds = [kind for kind, _ in self.calls]
+        start = kinds.index("adb")
+        self.assertEqual(self.calls[start + 1], ("sleep", core.WARM_SETTLE))
+        self.assertEqual(kinds[start + 2], "verify")
+        self.assertNotIn("force-stop", " ".join(c for k, c in self.calls if k == "adb"))
+
+    def test_post_links_keep_the_quick_open_even_with_a_post_showing(self):
+        with patch.object(core, "on_post_view", return_value=True), \
+                patch.object(core, "open_post", return_value=True) as opened, \
+                patch.object(core, "dismiss_chooser", return_value=False):
+            core.open_target_post("phone-1", FakeScreen([ONLINE]),
+                                  "https://www.facebook.com/page/posts/123")
+        self.assertTrue(opened.call_args.kwargs["allow_warm"])
+
+    def test_a_verified_first_link_skips_the_six_second_login_watch(self):
+        waits = []
+
+        def account_block(d, timeout=6):
+            waits.append(timeout)
+            return None
+        stop = []
+        target = core.make_target("https://www.facebook.com/reel/42", comment="x",
+                                  do_react=False, do_comment=True)
+        target["phone_ready"] = True
+        with patch.object(core, "connect_resilient", return_value=object()), \
+                patch.object(core, "ensure_device", side_effect=lambda s, d: d), \
+                patch.object(core, "wake_and_unlock"), \
+                patch.object(core, "stop_stale_usb_vpn", return_value=False), \
+                patch.object(core, "prefetch_comment"), \
+                patch.object(core, "open_target_post", return_value=True), \
+                patch.object(core, "wait_for_account_block", side_effect=account_block), \
+                patch.object(core, "close_fb"), \
+                patch.object(core, "stop_requested", side_effect=lambda: bool(stop)), \
+                patch.object(core, "_process_target",
+                             side_effect=lambda *a, **k: stop.append(1) or "abort"):
+            core.react_all_saved_accounts("phone-1", [target], "like", "x", False, True)
+        self.assertEqual(waits[0], 0)
+
+
 class StaleUSBVPNTests(unittest.TestCase):
     def setUp(self):
         self.calls, self.errors = [], []

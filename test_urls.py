@@ -543,6 +543,35 @@ class EveryLinkFormTests(unittest.TestCase):
             self.assertEqual(call.kwargs["severity"], "warning")
             self.assertIn(call.args[0], core._ERROR_HELP)
 
+    def test_a_slow_lookup_never_holds_the_phones_past_the_budget(self):
+        import threading, time as _time
+        share = "https://www.facebook.com/share/v/SlowLookup1/"
+        release = threading.Event()
+        reel_id = self.VIDEO_ID
+
+        class _SlowOpener:
+            def open(self, req, timeout=None):
+                release.wait(5)              # Facebook answering slowly
+                return _FakeResponse(share, '<link rel="canonical" href="'
+                                     'https://www.facebook.com/reel/' + reel_id + '/" />')
+        core._lookups.clear()
+        with mock.patch.object(core, "NOPROXY", _SlowOpener()), \
+                mock.patch.object(core, "report_error"), mock.patch("builtins.print"):
+            started = _time.monotonic()
+            out = core.normalize_targets_for_phones([{"url": share}], budget=0.3)
+            waited = _time.monotonic() - started
+            # The phones get the cleaned share link at once...
+            self.assertLess(waited, 2.0)
+            self.assertEqual(out[0]["url"], "https://www.facebook.com/share/v/SlowLookup1")
+            # ...each phone keeps that same URL (one wording pool per post)...
+            again = core.normalize_targets_for_phones(out, budget=0.3)
+            self.assertEqual(again[0]["url"], out[0]["url"])
+            # ...and the lookup still lands in the cache for the next run.
+            release.set()
+            core._lookups["https://www.facebook.com/share/v/SlowLookup1"].result(timeout=5)
+        self.assertEqual(core._url_resolve_cache["https://www.facebook.com/share/v/SlowLookup1"],
+                         "https://www.facebook.com/reel/" + self.VIDEO_ID)
+
     def test_unresolved_share_v_still_opens_as_a_reel_or_video(self):
         share = "https://www.facebook.com/share/v/19zVwRPKRW"
         opener, _ = self._two_agent_network(OSError("offline"), OSError("offline"))
