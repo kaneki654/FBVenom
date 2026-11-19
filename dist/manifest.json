@@ -1,8 +1,8 @@
 {
-  "version": "1.1.11",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.11/FBVenom.exe",
-  "sha256": "6012cb9ab26b573138cf706c96dc861d4cb429413f60ccc0c98dc3c7289508ca",
-  "notes": "Comments are written straight into the box, so posts get their comments again (typing used to throw the phone back to the feed); reels, videos and share links still open at once",
-  "size": 68289163,
-  "published": "2026-11-19T02:57:09+00:00"
+  "version": "1.1.12",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.12/FBVenom.exe",
+  "sha256": "216d6344ce9ff38d633470218544b8ae7f7ed7dd2e3ccfc3935169a315b0e20c",
+  "notes": "Works on any phone box: reels and videos open and get commented on 1080px phones too (Redmi/MIUI), a phone whose USB link hangs is reconnected by itself, and MIUI's 'Use USB for' pop-up is closed",
+  "size": 68294152,
+  "published": "2026-11-19T07:24:55+00:00"
 }
