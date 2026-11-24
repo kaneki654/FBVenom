@@ -3867,7 +3867,9 @@ class ReactionGUI(QMainWindow):
                                 else "Hover to count accounts")
                 self.dev_list.addItem(item)
                 self.dev_list.setItemWidget(item, w)
-                item.setSelected(True)
+                # Only phones that answer are picked by default: an
+                # UNAUTHORIZED one can do nothing until it is allowed.
+                item.setSelected(ok)
                 self.dev_items[serial] = item
             self.dev_count_lbl.setText(f"{len(devs)} reachable")
             if hasattr(self, "all_btn"):
@@ -4371,6 +4373,25 @@ class ReactionGUI(QMainWindow):
         self.update_briefing()
         return row
 
+    def insert_link_row_after(self, anchor, url="", reaction="like", comment=""):
+        """A filled link row right below `anchor` (used to split pasted links)."""
+        row = LinkRow(len(self.link_rows) + 1,
+                      on_remove=self.remove_link_row,
+                      on_change=self.update_briefing)
+        self.link_rows.insert(self.link_rows.index(anchor) + 1, row)
+        self.links_layout.insertWidget(self.links_layout.indexOf(anchor) + 1, row)
+        do_react, do_comment = parse_action_mode(self.action_mode())
+        row.set_columns(do_react, do_comment)
+        row._in = 1.0
+        row.url.setText(url)
+        row.comment.setText(comment)
+        row.reaction.setCurrentIndex(max(0, row.reaction.findData(reaction or "like")))
+        for i, r in enumerate(self.link_rows, start=1):
+            r.set_index(i)
+        self._relayout_for_links()
+        self.update_briefing()
+        return row
+
     def remove_link_row(self, row):
         if self.running:
             return              # the running session was started with this link
@@ -4481,17 +4502,39 @@ class ReactionGUI(QMainWindow):
             self._save_workspaces()
         mode = self.action_mode()
         do_react, do_comment = parse_action_mode(mode)
-        # normalise back into the rows so the user sees what will be used
-        for number, row in enumerate(self.link_rows, 1):
+        # normalise back into the rows so the user sees what will be used. A
+        # box holding several links - pasted together, even glued with nothing
+        # between them - becomes one row per link, each keeping its example.
+        # (2026-11-22: two share links in one box were run as ONE link that
+        # opened the news feed, and every phone reopened it for every account.)
+        split_notes = []
+        for row in list(self.link_rows):
             raw = row.url.text().strip()
-            if raw:
-                fixed = normalize_url(raw)
-                if fixed:
-                    row.url.setText(fixed)
-                else:
-                    event = fbcore.report_error("INVALID_URL", link_no=number,
-                                                url=raw, severity="warning")
-                    self.send_cmd({"action": "diagnostic", "event": event})
+            if not raw:
+                continue
+            number = self.link_rows.index(row) + 1
+            links = fbcore.split_links(raw)
+            if not links:
+                event = fbcore.report_error("INVALID_URL", link_no=number,
+                                            url=raw, severity="warning")
+                self.send_cmd({"action": "diagnostic", "event": event})
+                continue
+            row.url.setText(links[0])
+            anchor = row
+            for extra in links[1:]:
+                anchor = self.insert_link_row_after(
+                    anchor, extra, row.reaction.currentData(), row.comment.text())
+            if len(links) > 1:
+                split_notes.append(f"link {number} held {len(links)}")
+                event = fbcore.report_error("LINK_SPLIT", link_no=number, url=raw,
+                                            severity="warning",
+                                            detail=" + ".join(links))
+                self.send_cmd({"action": "diagnostic", "event": event})
+        if split_notes:
+            self.send_cmd({"action": "toast",
+                           "text": "Pasted-together links split ("
+                                   + ", ".join(split_notes)
+                                   + ") - each has its own row now."})
         targets = self.link_targets()
         if not targets:
             self.send_cmd({"action": "toast", "text": "Enter at least one post URL"})
@@ -4569,6 +4612,13 @@ class ReactionGUI(QMainWindow):
 
         def session_error_hook(event):
             self.send_cmd({"action": "diagnostic", "event": dict(event)})
+            if event.get("code") == "LINK_DEAD":
+                # Said where it is seen, not only in the diagnostics list: the
+                # run is still going, and the other links still get commented.
+                self.send_cmd({"action": "toast",
+                               "text": f"Link {event.get('link') or '?'} never opened "
+                                       f"on any phone - skipped for the rest of this "
+                                       f"run. The other links keep going."})
             if callable(old_error_hook):
                 try:
                     old_error_hook(event)
@@ -4585,6 +4635,9 @@ class ReactionGUI(QMainWindow):
             # Resolve opaque share/watch links once in this background thread,
             # before the device workers fan out. Every phone therefore opens
             # the same canonical target and the GUI never blocks on redirects.
+            # A fresh slate for the dead-link breaker: a link written off in
+            # the last run gets its chance again in this one.
+            fbcore.begin_run()
             targets = fbcore.normalize_targets_for_phones(targets)
             if not targets:
                 self.send_cmd({"action": "msg",
@@ -4730,6 +4783,17 @@ class ReactionGUI(QMainWindow):
                 try:
                     if not self.stop_flag:
                         wait_online(serial)
+                    # An unauthorized phone answers no command, so the install
+                    # check below read it as "Facebook Lite is not installed"
+                    # (2026-11-22: two Redmis that HAD it). Say what it is.
+                    if not self.stop_flag and fbcore.device_state(serial) == "unauthorized":
+                        fbcore.report_error("DEVICE_UNAUTHORIZED", serial=serial)
+                        with results_lock:
+                            results[serial] = "unauthorized"
+                        self.send_cmd({"action": "device_status",
+                                       "serial": serial, "status": "failed"})
+                        mark_done(serial, fully=False)
+                        return
                     if not self.stop_flag and not has_fb(serial):
                         if apk and install_fb(serial, apk):
                             pass

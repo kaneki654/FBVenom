@@ -4915,6 +4915,43 @@ def normalize_url(raw, _depth=0):
     query = _drop_fb_tracking(parts.query)
     return urllib.parse.urlunsplit(("https", clean_host, path, query, ""))
 
+# Two links pasted into one box arrive glued. Measured on this PC's run of
+# 2026-11-22: ".../share/p/1CiUaLY336/https://www.facebook.com/share/p/1JnE1NBsYP"
+# was read as ONE link, and the "//" collapse turned it into the path
+# ".../share/p/1CiUaLY336/https:/www.facebook.com/share/p/1JnE1NBsYP". Facebook
+# Lite opens that on the news feed, so every phone retried it for every
+# account - ~13 minutes of reopening per account (296 TARGET_OPEN_FAILED) while
+# the good links waited. A second link starts wherever a scheme, or a bare
+# facebook.com host, appears INSIDE the first one - but never as a query value
+# (`l.php?u=https://...` is one link and normalize_url unwraps it), never in
+# encoded form, and never as the host right after the first link's own scheme.
+_GLUED_LINK_RE = re.compile(
+    r"(?i)(?<=\S)(?<![=&?#.])(?<!://)(?<!%2F)"
+    r"(?=(?:https?://|(?:facebook|fb)://|"
+    r"(?:(?:www|m|web|mbasic|touch|mobile|business)\.)?facebook\.com/|"
+    r"fb\.(?:watch|me|gg)/))")
+
+
+def split_links(raw):
+    """Every Facebook link in pasted text, in order, each normalized.
+
+    Handles links separated by spaces or new lines, links inside a sentence,
+    and links glued together with nothing between them - including a pair a
+    previous normalize_url() already fused (".../https:/www.facebook.com/...").
+    Duplicates are dropped. A text holding one link gives a one-item list.
+    """
+    text = html.unescape(str(raw or "")).replace("\\/", "/")
+    # A "//" inside a path collapses to "/": put the second link's back.
+    text = re.sub(r"(?i)\b(https?|facebook|fb):/(?!/)", r"\1://", text)
+    text = _GLUED_LINK_RE.sub(" ", text)
+    links = []
+    for piece in text.split():
+        url = normalize_url(piece)
+        if url and url not in links:
+            links.append(url)
+    return links
+
+
 def parse_action_mode(mode):
     raw     = (mode or "").strip().lower()
     compact = re.sub(r"[^a-z]+", "", raw)
@@ -4982,6 +5019,9 @@ def wake_and_unlock(serial):
             run(["shell", "input", "keyevent", "224"], serial=serial)
             if not abort_sleep(1.5):
                 return
+            # MIUI raises its pocket guard on every screen-on when the top
+            # sensor is covered - always, inside a phone box.
+            dismiss_system_popup(serial)
         _, out, _ = run(["shell", "dumpsys", "window"], serial=serial)
         # Only a keyguard that is really SHOWING gets the unlock swipe.
         #
@@ -5239,6 +5279,11 @@ _ERROR_HELP = {
                                 "tap Share > Copy link, and paste that link instead."),
     "LINK_NOT_COMMENTABLE": ("Stories take private replies, not public comments, so this link was skipped.",
                              "Paste the link of a post, reel or video instead."),
+    "LINK_SPLIT": ("One link box held several links pasted together; each runs as its own link.",
+                   "Nothing to do - next time paste one link per box."),
+    "LINK_DEAD": ("This link never opened on any phone, so it is skipped for the rest of the run.",
+                  "Open it in a browser: it may be two links pasted together, deleted, private or "
+                  "not a single post. The other links keep running. Fix it and start again."),
     "TARGET_NOT_VERIFIED": ("The requested post view could not be verified.",
                             "Check the phone is on the intended content and has access; this link was skipped. "
                             "The phone's screen is saved in the debug folder."),
@@ -5741,36 +5786,59 @@ def fb_has_focus(serial):
     return False
 
 
-# System pop-ups that land on top of Facebook Lite and are safe to close with
-# Back (= Cancel, nothing changes). MIUI raises "Use USB for" every time a
-# phone's USB link connects - plugging the phone box in, and every adb
-# reconnect. Measured on a Redmi 9 (MIUI 12): it holds input focus, so each
-# dump read Settings instead of Facebook ("got the system window"), the post
-# verified as unreadable, and the run only escaped after its wander check fired.
-_DISMISSABLE_POPUPS = ("Settings$UsbDetailsActivity",)
+# System windows that land on top of Facebook Lite, each with the one key that
+# closes it without changing anything. Both measured on the Redmi 9 box (MIUI
+# 12, Android 10):
+#
+#   * "Use USB for" (Settings$UsbDetailsActivity) - raised every time a phone's
+#     USB link connects: plugging the box in, and every adb reconnect. Back is
+#     its Cancel.
+#   * MIUI's pocket guard (ScreenOnProximitySensorGuide): "Don't cover the
+#     earphone area. To turn this feature off, press the Volume up button." In
+#     a phone box the top sensor is covered (it read 0.00 = near from boot on
+#     4 of 7 phones), so MIUI raises the guard on EVERY screen-on and it never
+#     goes away by itself. It is invisible in screenshots, yet it holds input
+#     focus: every screen read returned only the navigation bar, and taps did
+#     not reach the app (a tap on "Cancel" under it changed nothing). Back does
+#     not close it; Volume up does - and the phone's setting stays on.
+_DISMISSABLE_POPUPS = (
+    ("ScreenOnProximitySensorGuide", "KEYCODE_VOLUME_UP",
+     "MIUI's 'Don't cover the earphone area' guard"),
+    ("Settings$UsbDetailsActivity", "KEYCODE_BACK",
+     "the phone's 'Use USB for' pop-up"),
+)
 
 
 def dismiss_system_popup(serial):
-    """Close a known system pop-up holding focus over Facebook Lite.
+    """Close the known system windows holding focus over Facebook Lite.
 
-    Only the exact windows named in _DISMISSABLE_POPUPS are touched - never a
-    USB-debugging prompt, a permission dialog or anything else. True when one
-    was closed.
+    Only the exact windows named in _DISMISSABLE_POPUPS are touched, each with
+    its own harmless key - never a USB-debugging prompt, a permission dialog
+    or anything else. The guard can sit on top of the USB pop-up, so it looks
+    again after each one. True when anything was closed.
     """
-    try:
-        _, out, _ = run(["shell", "dumpsys", "window"], serial=serial)
-    except Exception:
-        return False
-    for line in out.splitlines():
-        if "mCurrentFocus" not in line:
-            continue
-        if any(name in line for name in _DISMISSABLE_POPUPS):
-            run(["shell", "input", "keyevent", "KEYCODE_BACK"], serial=serial)
-            print(f"    [{serial}] closed the phone's 'Use USB for' pop-up")
-            dbg(serial, "popup-closed", line.strip()[:120])
-            time.sleep(0.6)
-            return True
-    return False
+    closed = False
+    for _ in range(3):
+        try:
+            _, out, _ = run(["shell", "dumpsys", "window"], serial=serial)
+        except Exception:
+            return closed
+        hit = None
+        for line in out.splitlines():
+            if "mCurrentFocus" not in line:
+                continue
+            hit = next((p for p in _DISMISSABLE_POPUPS if p[0] in line), None)
+            if hit:
+                break
+        if hit is None:
+            return closed
+        name, key, label = hit
+        run(["shell", "input", "keyevent", key], serial=serial)
+        print(f"    [{serial}] closed {label}")
+        dbg(serial, "popup-closed", name)
+        closed = True
+        time.sleep(0.6)
+    return closed
 
 def post_ready(d):
     try:
@@ -5889,6 +5957,23 @@ def _one_screen_read(d):
     except Exception:
         return d
     return snap if snap else d
+
+
+def _comment_box_on_screen(d):
+    """Facebook Lite's comment box is open below the top 30% of the screen.
+
+    Across ~2,000 real fleet dumps the only editable Facebook Lite field was
+    its comment box; search boxes sit at the top and other apps' fields are
+    ignored by _fb_comment_box().
+    """
+    try:
+        box = _fb_comment_box(d)
+        if box is None:
+            return False
+        _, height = safe_window_size(d)
+        return center(box)[1] > int(height * 0.30)
+    except Exception:
+        return False
 
 
 def _reel_sheet_open(d):
@@ -6556,7 +6641,11 @@ def _save_open_failure(serial, d, url):
     return dump_debug(serial, d, "target_not_verified")
 
 
-def open_post(serial, url, allow_warm=True, verify=None):
+def open_post(serial, url, allow_warm=True, verify=None, evidence=None):
+    # `evidence`: a device to save the screen from when the LAST opener fails,
+    # BEFORE Facebook Lite is closed. Saving it afterwards (as before) kept only
+    # the launcher - the 2026-11-22 debug folder holds six app drawers and not
+    # one picture of what Facebook Lite showed for the link.
     # Never (re)launch Facebook once Abort has been pressed.
     if stop_requested():
         return False
@@ -6614,7 +6703,7 @@ def open_post(serial, url, allow_warm=True, verify=None):
     poll_until(lambda: not fb_foreground(serial), 2.0)
     run(["shell", "am", "broadcast",
          "-a", "android.intent.action.CLOSE_SYSTEM_DIALOGS"], serial=serial)
-    for uri in variants:
+    for variant_no, uri in enumerate(variants, start=1):
         for args in _post_view_attempts(uri):
             if stop_requested():
                 return False
@@ -6632,6 +6721,11 @@ def open_post(serial, url, allow_warm=True, verify=None):
                 return True
             print(f"  [{serial}] '{uri[:50]}' opened Facebook but not the post "
                   f"- trying next variant...")
+            if evidence is not None and variant_no == len(variants):
+                try:
+                    _save_open_failure(serial, evidence, url)
+                except Exception:
+                    pass
             run(["shell", "am", "force-stop", FB_PACKAGE], serial=serial)
             poll_until(lambda: not fb_foreground(serial), 1.5)
             break
@@ -6678,7 +6772,8 @@ def open_target_post(serial, d, url, attempts=3):
                 serial, url, allow_warm=warm,
                 verify=lambda: (on_post_view(d, timeout=OPEN_VERIFY_SECONDS,
                                              feed_grace=OPEN_FEED_GRACE)
-                                or dump_is_blind(d)))
+                                or dump_is_blind(d)),
+                evidence=d if i == attempts - 1 else None)
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             opened = False
@@ -9166,7 +9261,15 @@ def post_comment(serial, d, text):
         if is_action_blocked(d):
             return fail("ACTION_BLOCKED", "action-blocked")
         state = composer_state()
-        if state == "empty" and on_post_view(d):
+        # The box we just typed in, now EMPTY and still Facebook Lite's comment
+        # box low on screen, proves both halves: the comment went (text does
+        # not clear by itself) and the phone never left the post (Back or a
+        # wander takes the box away). Needed because with the keyboard still
+        # up the box sits mid-screen with no marker text - measured on 3 of 7
+        # Redmi 9 phones (box at y=1381-1475 of 2340, text ""): on_post_view()
+        # alone said "not on the post" and every sent comment was reported
+        # "unverified".
+        if state == "empty" and (on_post_view(d) or _comment_box_on_screen(d)):
             return f"commented:{text}"
     dump_debug(serial, d, "comment_unverified")
     return fail("COMMENT_SUBMIT_UNVERIFIED", "comment-submit-unverified",
@@ -9563,7 +9666,19 @@ def normalize_targets_for_phones(targets, budget=None):
     pass straight through, so every phone keeps the SAME URL - the per-post
     wording pool that keeps comments from repeating is keyed by it.
     """
-    items = [dict(t) for t in (targets or [])]
+    items = []
+    for target in (targets or []):
+        item = dict(target)
+        if not item.get("phone_ready"):
+            # One box holding several links (pasted together, even glued with
+            # nothing between them) is several targets with the same example.
+            links = split_links(item.get("url", ""))
+            if len(links) > 1:
+                report_error("LINK_SPLIT", url=item.get("url", ""), severity="warning",
+                             detail=" + ".join(links))
+                items.extend(dict(item, url=link) for link in links)
+                continue
+        items.append(item)
     if not items:
         return []
     budget = RESOLVE_BUDGET if budget is None else float(budget)
@@ -9619,6 +9734,105 @@ _COMMENT_PLACE = {
     "post": "at the bottom of the post, or behind its Comment button",
     "photo": "at the bottom of the post, or behind its Comment button",
 }
+
+
+# ── Dead-link breaker ────────────────────────────────────────────────────────
+# Measured on this PC's run of 2026-11-22 (7 Redmi phones, 3 links): link 2 was
+# two share links pasted into one box. Facebook Lite opened it on the news feed
+# every time, and nothing remembered that - every phone retried it for EVERY
+# account (5 rounds of 3 cold opens of every opener, ~13 minutes per account,
+# 296 TARGET_OPEN_FAILED), while links 1 and 3 waited. One phone finished 3 of
+# its 8 accounts in 55 minutes. That is "it's not commenting and starting
+# again": Facebook Lite closing and reopening on a link that can never open.
+#
+# LINK_HEALTH is what the run has learned, shared by every phone. A link that
+# opened anywhere is never written off - some accounts simply cannot see a post
+# (a group they are not in). A link that has NEVER opened is written off for the
+# whole run once accounts that DID open other links (so the phone and the
+# account were fine) failed it on DEAD_LINK_PHONES phones, or DEAD_LINK_ACCOUNTS
+# times on one phone. Failures of an account that opened nothing at all (logged
+# out, blind phone) prove nothing about the link and are not counted.
+DEAD_LINK_PHONES = 2
+DEAD_LINK_ACCOUNTS = 3
+LINK_OPEN_TRIES = 2          # rounds of open_target_post() per link per account (was 5)
+
+
+class LinkHealth:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self._opened = set()
+            self._failed = {}     # url -> {(serial, account_num)}
+            self._dead = {}       # url -> why
+
+    def opened(self, url):
+        with self._lock:
+            self._opened.add(url)
+
+    def failed(self, url, serial, account):
+        """Count one failure by an account that opened another link.
+
+        True when this failure is the one that writes the link off.
+        """
+        with self._lock:
+            if url in self._opened or url in self._dead:
+                return False
+            seen = self._failed.setdefault(url, set())
+            seen.add((serial, account))
+            phones = {s for s, _ in seen}
+            most_on_one = max(sum(1 for s, _ in seen if s == p) for p in phones)
+            if len(phones) >= DEAD_LINK_PHONES or most_on_one >= DEAD_LINK_ACCOUNTS:
+                self._dead[url] = (f"failed for {len(seen)} account(s) on "
+                                   f"{len(phones)} phone(s) that opened other links, "
+                                   f"and never opened anywhere this run")
+                return True
+            return False
+
+    def is_dead(self, url):
+        with self._lock:
+            return url in self._dead
+
+    def reason(self, url):
+        with self._lock:
+            return self._dead.get(url, "")
+
+
+LINK_HEALTH = LinkHealth()
+
+
+def begin_run():
+    """Start a run with a clean slate: forget what the last run learned."""
+    LINK_HEALTH.reset()
+
+
+def _account_did(results, account, link_no, tgt):
+    """This account already did this link in this run - so it must not again.
+
+    The coverage pass brings back accounts that missed a link. Only the
+    unverified-send case used to be skipped, so an account returning for link 2
+    walked links 1 and 3 again and commented on them a second time.
+    """
+    if not isinstance(results, RunResults) or not account:
+        return False
+    row = results.account_tally.get((account, link_no)) or {}
+    if tgt.get("do_comment"):
+        return row.get("commented") in ("ok", "comment-submit-unverified")
+    if tgt.get("do_react"):
+        return row.get("reacted") == "ok"
+    return False
+
+
+def _strike_link(serial, account_num, link_no, url):
+    """A healthy account could not open `url`: count it against the link."""
+    if LINK_HEALTH.failed(url, serial, account_num):
+        why = LINK_HEALTH.reason(url)
+        report_error("LINK_DEAD", serial, account_num=account_num, link_no=link_no,
+                     url=url, detail=why)
+        print(f"[{serial}] LINK {link_no} WRITTEN OFF for the rest of the run - {why}")
+        dbg(serial, "link-dead", f"link {link_no} {url} | {why}")
 
 
 def react_all_saved_accounts(serial, url_or_targets, reaction="like",
@@ -9709,6 +9923,7 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
     # but calling it here cost an extra switcher open - 34s per phone - before
     # the first post was even opened, and the walk sees the same names anyway.
     roster = []
+    dead_noted = set()           # written-off links this phone already announced
     current_account = FIRST_ACCOUNT_PLACEHOLDER
     coverage_retried = False     # the one extra sweep over accounts that missed
     # Hard ceiling. No phone has anywhere near this many logins, so if the
@@ -9748,7 +9963,20 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
         GATE_LINKS    = 3
         gate_link_no  = 0            # which link the gate actually left open
         gate_blocked  = False
-        for gate_no, gate_tgt in enumerate(targets[:GATE_LINKS], start=1):
+        # This account's links still to do: never a written-off link, and
+        # never one it already commented on (the coverage pass brings
+        # accounts back, and they must not comment twice).
+        todo = [(no, t) for no, t in enumerate(targets, start=1)
+                if not LINK_HEALTH.is_dead(t["url"])
+                and not _account_did(results, current_account, no, t)]
+        if all(LINK_HEALTH.is_dead(t["url"]) for t in targets):
+            print(f"[{serial}] every link is written off - nothing left to do "
+                  f"on this phone.")
+            results.append("all-links-dead")
+            break
+        account_opened = False       # did ANY link open for this account?
+        unproven = []                # (link_no, url) failed before one did
+        for gate_no, gate_tgt in todo[:GATE_LINKS]:
             gate_url = gate_tgt["url"]
             for gate_try in range(GATE_ATTEMPTS):
                 if stop_requested():
@@ -9792,9 +10020,17 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                     return results
             if gate_link_no or gate_blocked:
                 break
+            unproven.append((gate_no, gate_url))
             print(f"    [{serial}] link {gate_no} will not open for account "
                   f"{account_num} - trying the next link as the gate")
-        if gate_link_no or gate_blocked:
+        if gate_link_no:
+            LINK_HEALTH.opened(targets[gate_link_no - 1]["url"])
+            account_opened = True
+            # This account works, so the gate links it could not open count.
+            for failed_no, failed_url in unproven:
+                _strike_link(serial, account_num, failed_no, failed_url)
+            unproven = []
+        if gate_link_no or gate_blocked or not todo:
             no_gate_accounts = 0
         else:
             # Nothing opened. Fall THROUGH rather than sitting here: the
@@ -9816,7 +10052,7 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
         # and not suspended, so one look is enough. Watching a healthy account
         # for 6 s - it can never return early - was 6 s of nothing after every
         # account's first link opened. Only a gate that opened NOTHING waits.
-        status = wait_for_account_block(d, timeout=0 if gate_link_no else 6)
+        status = wait_for_account_block(d, timeout=0 if (gate_link_no or not todo) else 6)
         if status == "not-successful":
             results.append(status)
             report_error("ACCOUNT_LOGIN_REQUIRED", serial, account_num=account_num)
@@ -9897,6 +10133,20 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                 if stop_requested():
                     results.append("stopped")
                     return results
+                if _account_did(results, current_account, link_no, tgt):
+                    continue          # already commented with this account
+                if LINK_HEALTH.is_dead(tgt["url"]):
+                    # Written off: skipped in an instant instead of ~13 min of
+                    # reopening per account. Said once per phone.
+                    results.append(f"link{link_no}-dead")
+                    _tally(results, link_no, tgt["url"], "failed")
+                    _note_account(results, current_account, link_no, "commented",
+                                  "link-dead")
+                    if link_no not in dead_noted:
+                        dead_noted.add(link_no)
+                        print(f"    [{serial}] link {link_no} is written off - "
+                              f"skipping it for every remaining account")
+                    continue
                 # Point this thread at the link we are ABOUT to open, before
                 # opening it. _is_reel_context() reads this, and the reel rail
                 # is only accepted when it agrees - so while it still named the
@@ -9911,7 +10161,10 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                     # the gate left ONE link on screen (0 = none opened); every
                     # other link still has to be opened here
                     opened = False
-                    for _ in range(5):
+                    # open_target_post() already makes 3 cold attempts of
+                    # every opener; 5 rounds of that was ~13 minutes per
+                    # account on a link that could never open.
+                    for round_no in range(LINK_OPEN_TRIES):
                         if stop_requested():
                             results.append("stopped")
                             return results
@@ -9922,16 +10175,30 @@ def _react_all_saved_accounts(serial, targets, take_screenshots=False):
                         except Exception as e:
                             report_error("TARGET_OPEN_FAILED", serial, account_num=account_num,
                                          link_no=link_no, url=tgt["url"], exc=e)
-                        print(f"    [{serial}] link {link_no}: open failed, retrying...")
-                        if not abort_sleep(3):
-                            results.append("stopped")
-                            return results
-                    if not opened:
+                        if round_no + 1 < LINK_OPEN_TRIES:
+                            print(f"    [{serial}] link {link_no}: open failed, retrying...")
+                            if not abort_sleep(3):
+                                results.append("stopped")
+                                return results
+                    if opened:
+                        LINK_HEALTH.opened(tgt["url"])
+                        if not account_opened:
+                            account_opened = True
+                            for failed_no, failed_url in unproven:
+                                _strike_link(serial, account_num, failed_no, failed_url)
+                            unproven = []
+                    else:
                         results.append(f"link{link_no}-open-failed")
                         _tally(results, link_no, tgt["url"], "failed")
+                        _note_account(results, current_account, link_no, "commented",
+                                      "open-failed")
                         report_error("TARGET_OPEN_FAILED", serial, account_num=account_num,
                                      link_no=link_no, url=tgt["url"])
                         print(f"    [{serial}] link {link_no}: could not open - skipping")
+                        if account_opened:
+                            _strike_link(serial, account_num, link_no, tgt["url"])
+                        else:
+                            unproven.append((link_no, tgt["url"]))
                         # A logged-out or checkpointed account fails EVERY link
                         # the same way, and each try costs ~75s - ten links is
                         # over an hour of a phone doing nothing before the
@@ -10045,7 +10312,10 @@ def _accounts_to_retry(roster, results, targets):
     """
     if not isinstance(results, RunResults) or not roster:
         return []
-    wanted = [n for n, t in enumerate(targets or [], 1) if t.get("do_comment")]
+    # A written-off link is missed by every account; it must not send them all
+    # round again (they would only skip it a second time).
+    wanted = [n for n, t in enumerate(targets or [], 1)
+              if t.get("do_comment") and not LINK_HEALTH.is_dead(t.get("url", ""))]
     if not wanted:
         return []
     missed = []
@@ -10071,6 +10341,12 @@ def _report_account_coverage(serial, roster, results, targets):
     if not wanted:
         return
     for link_no, tgt in wanted:
+        if LINK_HEALTH.is_dead(tgt.get("url", "")):
+            line = (f"link {link_no}: written off - it never opened on any phone "
+                    f"({LINK_HEALTH.reason(tgt.get('url', ''))})")
+            print(f"  [coverage] [{serial}] {line}")
+            dbg(serial, "coverage", line)
+            continue
         done, missed = [], []
         for name in roster:
             row = results.account_tally.get((name, link_no))
@@ -10140,6 +10416,7 @@ def cli_main():
             device_reactions[serial] = ""
     for serial in ready:
         wake_and_unlock(serial)
+    begin_run()                  # a fresh slate for the dead-link breaker
     results_lock = threading.Lock()
     def run_device(serial):
         try:

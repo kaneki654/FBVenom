@@ -513,6 +513,14 @@ hubs, with scrcpy mirroring every phone.
   Back (Cancel, nothing changes) when a phone starts, after a reconnect, and
   whenever a read finds it on top. A USB-debugging prompt or any other dialog
   is never touched.
+- **MIUI's pocket guard is closed** (1.1.13). In a phone box the top sensor is
+  covered (it read "near" from boot on 4 of 7 Redmis), so MIUI raises "Don't
+  cover the earphone area" on every screen-on, and it never goes away by itself.
+  It's invisible in screenshots but holds input focus: every screen read
+  returned only the navigation bar, and a tap under it changed nothing. Back
+  doesn't close it, so FBVenom presses **Volume up**, which is the way out the
+  guard itself names. The phone's setting stays on. It's closed when a phone
+  starts, after every screen wake, and whenever a read finds it on top.
 
 When you plug in a new phone box, every phone has to trust this PC once: unlock
 it and tap **Allow** (tick *Always allow from this computer*) on the USB
@@ -520,6 +528,36 @@ debugging prompt. A phone that stays `UNAUTHORIZED`: Developer options →
 *Revoke USB debugging authorizations*, switch USB debugging off and on, replug,
 and tap Allow. On Xiaomi/Redmi (MIUI) also turn on *USB debugging (Security
 settings)* and *Install via USB*, or Android refuses the taps.
+
+### Run guard: one bad link can't stall the run
+
+Since 1.1.13. On this PC's run of 2026-11-22, link 2 was two share links
+pasted into one box. It was run as one link that Facebook Lite opens on the news
+feed, so every phone closed and reopened Facebook Lite on it for about 13 minutes
+per account (296 `TARGET_OPEN_FAILED`), and links 1 and 3 only got a turn in
+between. One phone finished 3 of its 8 accounts in 55 minutes. Now:
+
+- **Pasted-together links are split.** A box holding several links (on separate
+  lines, inside a sentence, or glued together with nothing between them) becomes
+  one row per link when you press ENVENOM, each keeping its example comment
+  (`LINK_SPLIT`). The engine splits them too, for links that never pass
+  through the window.
+- **A link that never opens is written off for the run** (`LINK_DEAD`). It's
+  dropped once accounts that *did* open other links have failed it on 2 phones,
+  or 3 times on one phone. After that every phone skips it in an instant and the
+  other links keep going. A link that opened anywhere is never written off,
+  because some accounts can't see some posts (a group they aren't in). Failures
+  of an account that opened nothing (logged out, a blocked screen) don't count
+  against a link. The next run gives every link a fresh chance.
+- **Each link gets 2 rounds per account** of the 3-attempt open, not 5.
+- **An account never comments twice on the same link.** The end-of-run pass
+  that brings back accounts which missed a link now only does the links each
+  one missed, and it ignores written-off links.
+- **The screen is saved before Facebook Lite closes.** A failed open's debug
+  picture used to be taken after the app was closed, so it only showed the
+  launcher.
+- **Unauthorized phones are reported as unauthorized**, not as "Facebook Lite
+  is not installed", and they aren't picked by default.
 
 ## Error diagnostics
 
