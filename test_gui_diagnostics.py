@@ -117,6 +117,23 @@ class DiagnosticsGuiTests(unittest.TestCase):
                 self.assertEqual(self.window._diagnostic_events[0]["code"], expected)
                 self.assertEqual(self.window._diagnostic_events[0]["serial"], "phone-a")
 
+    def test_an_unauthorized_phone_is_reported_as_unauthorized_not_missing_the_app(self):
+        # 2026-11-22: two Redmis that HAD Facebook Lite were reported as
+        # "not installed" - an unauthorized phone answers no command at all.
+        with patch.object(gui.fbcore, "normalize_targets_for_phones", return_value=[{"url": "https://www.facebook.com/posts/123"}]), \
+                patch.object(gui, "find_apk", return_value=None), \
+                patch.object(gui, "reset_comment_pool"), \
+                patch.object(gui, "wake_and_unlock"), \
+                patch.object(gui, "wait_online", return_value=False), \
+                patch.object(gui, "has_fb") as has_fb, \
+                patch.object(sys, "stdout", io.StringIO()):
+            self.window._clear_diagnostics()
+            self.window.run_reactions([], "like", ["phone-a"])
+            self.window.process_queue()
+        self.assertEqual(self.window._diagnostic_events[0]["code"], "DEVICE_UNAUTHORIZED")
+        self.assertEqual(self.window._diagnostic_events[0]["serial"], "phone-a")
+        has_fb.assert_not_called()
+
     def test_options_and_diagnostics_stay_accessible_at_minimum_size(self):
         self.window.resize(self.window.minimumSize())
         self.window.show()

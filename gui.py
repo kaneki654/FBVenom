@@ -4781,12 +4781,14 @@ class ReactionGUI(QMainWindow):
                                "serial": serial, "status": "processing"})
 
                 try:
+                    online = True
                     if not self.stop_flag:
-                        wait_online(serial)
-                    # An unauthorized phone answers no command, so the install
+                        online = wait_online(serial)
+                    # wait_online() gives up only on an UNAUTHORIZED phone (or
+                    # Abort). Such a phone answers no command, so the install
                     # check below read it as "Facebook Lite is not installed"
                     # (2026-11-22: two Redmis that HAD it). Say what it is.
-                    if not self.stop_flag and fbcore.device_state(serial) == "unauthorized":
+                    if not self.stop_flag and online is False:
                         fbcore.report_error("DEVICE_UNAUTHORIZED", serial=serial)
                         with results_lock:
                             results[serial] = "unauthorized"
