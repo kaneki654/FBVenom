@@ -1,8 +1,8 @@
 {
-  "version": "1.1.12",
-  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.12/FBVenom.exe",
-  "sha256": "216d6344ce9ff38d633470218544b8ae7f7ed7dd2e3ccfc3935169a315b0e20c",
-  "notes": "Works on any phone box: reels and videos open and get commented on 1080px phones too (Redmi/MIUI), a phone whose USB link hangs is reconnected by itself, and MIUI's 'Use USB for' pop-up is closed",
-  "size": 68294152,
-  "published": "2026-11-19T07:24:55+00:00"
+  "version": "1.1.13",
+  "url": "https://github.com/kaneki654/FBVenom/releases/download/v1.1.13/FBVenom.exe",
+  "sha256": "e950aca7fb59059d96bb0a9142209cb8618f6db26e3153655c103f70db7cc65c",
+  "notes": "Never stuck reopening one link again: links pasted together are split, a link that never opens is skipped for the rest of the run so the others keep commenting, no account comments twice, and MIUI's hidden 'Don't cover the earphone area' screen is closed",
+  "size": 68447987,
+  "published": "2026-11-24T05:25:21+00:00"
 }
